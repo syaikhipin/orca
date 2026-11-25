@@ -38,5 +38,7 @@ services:
       # the owner's Opencode Go key, same as GreenForge.
       - META_API_BASE_URL=https://opencode.ai/zen/go/v1
       - META_MODEL=glm-5.3
-    ports:
-      - "8000:8000"
+    # No host port binding: GreenForge already owns host :8000 on campus-pc.
+    # Coolify's proxy reaches this container on its internal port via labels.
+    expose:
+      - "8000"
