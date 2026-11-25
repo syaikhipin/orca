@@ -4,6 +4,8 @@
 FROM node:22-slim AS web
 WORKDIR /build/web
 COPY web/package.json web/package-lock.json ./
+# postinstall runs scripts/copy-wasm.mjs during npm ci; it must exist by then.
+COPY web/scripts/ ./scripts/
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
