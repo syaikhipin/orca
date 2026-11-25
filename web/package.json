@@ -1,0 +1,35 @@
+{
+  "name": "orca-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test tests/*.test.mjs",
+    "preview": "vite preview",
+    "copy-wasm": "node scripts/copy-wasm.mjs",
+    "postinstall": "node scripts/copy-wasm.mjs"
+  },
+  "dependencies": {
+    "dockview-react": "8.5.1",
+    "lucide-react": "1.48.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "three": "0.186.1",
+    "three-mesh-bvh": "0.9.16",
+    "web-ifc": "0.0.77"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/three": "0.186.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "5.9.3",
+    "vite": "8.3.5"
+  },
+  "overrides": {
+    "dockview": "8.5.1",
+    "dockview-core": "8.5.1"
+  }
+}

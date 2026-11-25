@@ -1,0 +1,20 @@
+# Only the named, IssueLab-owned demo models ship in git. Keep other local data out.
+samples/*
+!samples/README.md
+!samples/Northbank-Architecture.ifc
+!samples/Northbank-Grids.ifc
+!samples/Northbank-MEP-Rev04.ifc
+!samples/Northbank-MEP.ifc
+!samples/Northbank-Site.ifc
+!samples/Northbank-Structure.ifc
+!samples/PC-03-Palletising-Cell-RevA.step
+!samples/PC-03-Palletising-Cell-RevB.step
+*.spike.ifc
+node_modules/
+web/dist/
+web/public/wasm/
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+server/.sightline-settings.json

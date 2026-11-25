@@ -1,0 +1,2184 @@
+# 22 · Build log (Oct 27 – Oct 30)
+
+> Moved verbatim from `CLAUDE.md` ("Status and next steps") on Oct 30, so the agent guide stays short. This is
+> history: each entry records what was built, measured and decided at the time, and its numbers (test counts,
+> timings) were true then. The topic docs [01](01-product-and-journeys.md)–[21](21-glossary-and-naming.md) describe
+> the code as it is now; where they and this log disagree, the code and the topic docs win.
+>
+> New work adds a short dated entry at the end (what changed, where in the code, how it was checked, any owner
+> decision) **and** updates the topic docs it touches (see [README.md](README.md), "Keeping these docs current").
+
+Done: skeleton, federated scene, neighbourhood check, agent loop (tested with a scripted model), API, MCP server,
+Northbank spikes 1–4, Modal deploy script (`deploy/modal_app.py`: one container, because scenes live in memory;
+proposal caps in `server/sightline/limits.py`). Proposal scores go in `evals/results.csv` (append-only; see
+evals/README.md). Historical Oct 27 validation: 66 server tests (`cd server && uv run pytest -q`), web build (`cd web && npm run build`).
+
+Wider fixes (Oct 28): the approved program spans isolated geometry/connection checks, a bounded planner/API/chat
+slice and whole-proposal review/acceptance in the viewer. Read `docs/superpowers/specs/2026-10-28-context-fixes.md`,
+`docs/superpowers/plans/2026-10-28-context-review-fixes.md` and `docs/superpowers/context-fixes-progress.md` for the
+current delivery/verification state. Context offsets support exact plain rectangular/circular profiles on horizontal
+straight services, with vertical or lateral detours; compound/sloped routes and hollow, rounded or U profiles are
+unsupported. Structural adequacy and service performance require designer review. Exact unchanged authored external
+frame defects remain acknowledged review evidence; new geometry or connection violations reject. Earlier test counts
+below are historical snapshots, not the current suite size.
+
+Live (Modal app `orca` since Oct 29): https://dodzikojo--orca-web.us-east.modal.run. Deployed Oct 27 (Northbank in `samples/`; a #042
+proposal took 121 s, 15 attempts, 3 verified options). Behind the cloud session's proxy the Modal CLI needs
+`uv tool install 'modal[api-proxy-support]'`. Triage eval over Navisworks results: `evals/navisworks_triage.py`
+(evals/README.md): 6/6 answer key, 129/129 non-physical, 51/55 touches on 317 Northbank results (Muse Spark Open: 6/6,
+129/129, 49/55).
+
+Navisworks clash reports (Oct 27): `server/sightline/reports.py` reads the XML (standard flat tags and the
+three-view export's grouped tags); the app opens samples from `samples/reports/<name>/` or uploads, lists clashes by
+test with their A/B/C images, matches them to the open model (Northbank: 290/317, the rest are Site elements) and
+re-measures on selection (now 317/317 with Site). Proposals on a report clash get its images. Muse Spark tool calling works natively on
+`api.meta.ai` (OpenAI `tools`, 2 s round trip, streaming): the chat over reports + model is next (plan below).
+
+Local offsets (Oct 27): `server/sightline/edits.py` splits a straight extruded segment (profile upright or on its
+side), raises/lowers the middle with 90° bend fittings and short risers (Bends, below), keeps the original GlobalId on the
+first piece and re-chains ports; tried in an IfcOpenShell transaction and undone. `edits.passages` finds openings in
+the obstacle by ray casting (Northbank's girder openings are cut into its geometry, no IfcOpeningElement). With that
+text Muse Spark's first proposal passes on #042/#057/#061 at Rev04's heights (evals/README.md). UI: offset preview,
+**Accept this fix** (server applies, browser reloads that file), re-measure.
+
+UX pass (Oct 27): `POST /propose/stream` streams the agent's steps as NDJSON (thinking, ideas, checking, attempt,
+result); the UI shows a live status line and an "Agent activity" table. `META_REASONING_EFFORT=low` by default and the
+loop stops after the first round with a verified option: a proposal now takes ~17 s (was 60-100 s). Options carry
+`before` meshes: Before / After / Both (orange ghost) and a before/after summary, framed on the change. Fixed
+clashes are marked in the list (every report entry with the same pair) and the panel; accepted offset pieces stay
+with their element on later selections.
+
+Viewer overhaul (Oct 27): modes Shaded / X-ray / Context (within 2.5 m) /
+Isolate, with the focus pair drawn as its own meshes over the batched buffers (no copies) and outlined through other
+geometry; section box (clipping planes) around the clash; marker + label at the clash point; animated camera; presets
+Top/Front/Right/Iso, Fit, Go to clash; per-model visibility; measure (point to point, Δxyz); properties card on single
+click (double-click still picks A/B); screenshot; keys 1-4 H F X C I V S E M Esc. Navigation frames the zone where the
+two elements meet (overlap or gap + margin, distance from the field of view), runs on every click, and falls back to
+the report's clash point; ports are shown by their owning element (`match()` returns `show`).
+
+Chat (Oct 27): `server/sightline/chat.py`, Muse Spark tool loop (≤8 model calls per message) over the Workspace:
+report_summary (per class pair: count, worst mm, touching, non-physical), list/get clash, look_at_clash_images (sent
+as a user message, tool results are text only), measure, describe/find elements, find_openings, check_move/offset,
+propose_fixes (the agent; counts against proposal caps), show_clash and set_view (page actions). `POST /api/chat`
+streams NDJSON; sessions in memory. UI: right pane tab "Chat with ORCA"; chat-driven proposals fill the options
+panel and the activity table. Gotcha: Chromium's `scrollIntoView` returns a Promise; an effect that returns it
+breaks React's cleanup and blanks the panel, so effects use braces.
+
+Plans (Oct 27): `server/sightline/plans.py`. Batch: agent per distinct pair in parallel threads (`agent.resolve(lock=)`:
+model calls overlap, geometry trials serialise on `Workspace.lock`, an RLock that every geometry operation takes),
+then `verify_together` applies all fixes in one multi-file transaction and checks each against everything incl. the
+other fixes. Root causes: hubs = elements with ≥2 real partners (physical, overlap > 1 mm, not fixed), cross-discipline
+first, plus geometry hits missing from the report; `build_root_cause` asks Muse (`domain_packs/root_cause.md`) for
+cause + strategy (move_hub / fix_partners). Northbank: girder plan with #042/#057/#061 (the last not in the report) at
+Rev04 heights, ~45-58 s. Plans cost one proposal per pair (`ProposeLimit.take_many`, all or nothing); a root cause costs one for the cause and is charged for its fixes only if it needs edits (`build_root_cause(charge=)`). Demo caps: 20 proposals per visitor per hour, 300 a day. UI pass: lucide
+icons with `data-tip` tooltips, viewer icon rail, Clash / Plan / Chat tabs, multi-select + "Fix n together" bar,
+Root causes card.
+
+Insights (Oct 27): `plans.patterns` groups real clashes by class pair + files (≥3 pairs); `triage_patterns` = one
+Muse call (`domain_packs/patterns.md`) → by_design (+ clash rule) / modelling_error / real_problem. Root-cause strategy
+`as_designed` returns a plan with no edits and `advice`. UI: Insights panel (all root causes, patterns, Explain), a
+client-side `reviewed` state (by design / for author) that root causes, patterns and plans exclude like fixes.
+Northbank: 11 patterns; bolts/plates, columns/slabs, beams/columns, curtain-wall joints → by design; duplicate braces,
+low base plates → modelling error; lift pit walls vs footings → real problem.
+
+Bulk triage (Oct 27): `server/sightline/triage.py`. Sure rules first (non-physical class, touch ≤ 1 mm; no model
+call), then one strict-JSON call per clash, 8 workers, same prompt/schema as `evals/navisworks_triage.py`.
+`meta_client.triage_model()`: Muse Spark Open on Baseten (`TRIAGE_API_KEY`/`BASETEN_API_KEY`, `TRIAGE_API_BASE_URL`,
+`TRIAGE_MODEL`, `TRIAGE_IMAGES`) else Muse Spark; json_schema refused (400/422) → JSON mode with the schema in the
+prompt. `triage.Job` is shared per sample report (`sample:<root>`; uploads per id), replays to late subscribers; a run
+costs one proposal. `POST /api/reports/{rid}/triage/stream`, `GET /api/reports/{rid}/triage`. UI: Triage card (progress,
+verdict filter chips, Set aside / Flag), row tags, reading in the clash panel. Northbank on Muse Spark: 317 in 119 s,
+184 by rule, answer key real/high/MEP.
+
+Muse Spark Open (Oct 27): Baseten's name is `meta-models/muse-spark-open` (`/v1/models`); it takes strict json_schema
+and images; no reasoning_effort is sent. Eval on all 317 (`evals/runs/2026-10-27-northbank-open-triage/`): 6/6 answer key,
+129/129 non-physical, 49/55 touching (Muse Spark 51/55), 0 failures, median 6.1 s vs 10.0 s; agrees with Muse Spark on
+299/317, but called the B1 pad footing vs lift pit wall (−471 mm, real) by_design. Deployed with `TRIAGE_API_KEY` in the
+`sightline-meta` secret: a live run starts with `"open_weights": true`, 317 in 189 s (184 by rule, median call 7.9 s,
+max 33 s; slower end to end than Muse Spark's 119 s because of the tail).
+
+Viewer fixes (Oct 27): a move option frames where the moved element meets the other side (`Viewer.frameFix`), not the
+whole run; the wheel zooms to the cursor. When both sides resolve to one element (35 of Northbank's 317: a port and its
+own valve, two Navisworks parts of one door) it is drawn purple (`Side = "ab"`) with a note in the clash panel.
+
+The agent drives the viewer (Oct 27): `agent.resolve(trials=True)` (single proposals and chat; not plans, which run
+agents in parallel) emits `{"type": "trial", index, kind, moved, delta_m, pieces}` with the candidate in place before
+its check, and attempts carry `hit_ids`. `web/src/pilot.ts` plays them at a readable pace (catches up when steps
+queue): amber while checking, teal when clear, hits magenta, camera via `frameFix`, slow orbit (`Viewer.orbit`) while
+Muse thinks; the result shows once the steps on screen finish. Any camera move or click in the viewer
+(`Viewer.onUserCamera`) is a takeover: the pilot clears what it drew and stops, the agent keeps going; the pill's
+**Let ORCA drive** resumes from the next idea. Historical validation: 50 server tests.
+
+Start page (Oct 27): the empty viewer shows `About.tsx` (what a clash is, what ORCA does, colour legend, glossary,
+"try it" steps; written for people new to BIM) with **Open the Northbank demo**: the sample report first (its list shows
+at once), then the default models, now including Site (all 317 report clashes link; 290 without it). The header's
+**How it works** opens the same page as a dialog. Side panels resize from their inner edge (remembered per browser).
+Until a report or the models are open the app is a landing page (`.app.landing`: no panels or dock; the header carries
+the demo button): what happens after the click, measured numbers (15-25 s to a verified fix, 3/3 designer fixes, 317
+triaged in 3-4 min), built-with. Keep those numbers true to measured runs if they change.
+
+Demo report trimmed (Oct 27): sample reports drop every clash test involving IfcGeographicElement, IfcSpace or
+IfcBuildingElementProxy (`service.SAMPLE_EXCLUDE`, env `SIGHTLINE_SAMPLE_EXCLUDE`; uploads are kept whole). Northbank:
+217 clashes in 52 tests (was 317 in 73), all linked; ids are renumbered (#042 is c0053). Triage of the 217 on Muse Spark
+Open: 213 s, 99 by rule, 0 errors, #042 real/high. The eval scripts still read the full package (317).
+
+Muse Spark's reasoning (Oct 27): the chat completions API hides it (reasoning tokens counted, text not returned), but
+Meta's Responses endpoint streams reasoning summaries (`reasoning: {summary: "auto"}`, strict json_schema and images
+work there too). `MetaChatModel.complete_json_reasoning` uses it when someone is watching (`resolve(trials=True)`:
+single proposals and chat), emitting `{"type": "reasoning", round, text}`; falls back to chat completions on 400/404/422
+and never for other hosts. About 2-3 notes per round, the first after ~3.5 s ("detailed" gave no more). UI: live notes
+under Understanding (`Thinking` in App.tsx), the pilot's status line, then folded into "How Muse Spark reasoned".
+
+Clash pictures read by colour (Oct 27): `web/src/clashImage.ts` reads each Navisworks picture in the browser (512 grid,
+~8 ms): red A, green B, and where they meet (the red-green blend of a see-through view, or the seam where a solid pair
+touches). List and panel thumbnails zoom to that zone (`ClashThumb`, read when scrolled into view); the image dialog has
+outlines, the zone in amber, and Zoom to the clash. SAM 3.1 (`sam-3.1` on api.meta.ai, via /v1/responses; output is
+special-token text, `meta-sam-parser` decodes it) was tried first: on these flat renders it found nothing from text
+prompts and, from point prompts, outlined 52-91% of each element and never the overlap, so colour does this job.
+SAM fits site photos and video, not Navisworks renders.
+
+Voice (Oct 27): Chat's mic button records (`web/src/voice.ts`: MediaRecorder, then decoded, mixed to mono and resampled
+to 16 kHz WAV in the browser), `POST /api/transcribe` forwards it to Muse Voice Transcribe (`POST /v1/asr/transcribe`,
+multipart: `request` JSON {model, audioEncoding "WAV", mode "PUSH_TO_TALK", keywords, languageBias} + `audio`; reply
+`transcript`), biased to BIM words and the open report's clash names, and the transcript is sent as a chat message, so
+voice drives everything chat can. Caps `SIGHTLINE_VOICE_PER_HOUR/DAY`, 60 s / 3 MB per clip. Checked end to end with a
+fake microphone (format accepted, audio duration right); recognition itself is untested here: no speech audio could be
+fetched or generated in the cloud session.
+
+Live voice (Oct 29; design in `docs/voice.md`, code `server/sightline/voice_live.py`, `LiveVoice` in `web/src/voice.ts`):
+Muse has no text-to-speech, so voice got real-time recognition instead. The mic streams 16 kHz PCM (an AudioWorklet
+resamples) over `/api/voice/live`, which relays to `wss://api.meta.ai/v1/asr/realtime` (the key goes in Meta's first
+frame, so the browser cannot connect itself). **Hold to talk** is the default: captions in the message box while held,
+sent on release (final ~0.3 s after); a quick tap latches. **Hands-free** (toggle, `sightline.voice.handsfree`,
+`ENDPOINTING`): each sentence is sent at the pause, queued while ORCA answers. One session = one voice cap use; same
+origin only; the owner cookie reaches sockets via `_OwnerContext`; the socket failing falls back to the upload path.
+Audio may run 1.5 s ahead of the clock (Meta garbles a 5 s burst, takes 3 s). Speech recognition is now tested with
+espeak-ng speech (`apt-get install espeak-ng` works in the cloud session) through the relay and in Chromium with a fake
+microphone; keywords turned "supply adequate" into "supply air duct". Status notes sit above the input so the mic
+doesn't move. Live on Modal since Oct 29: Modal's edge passes the socket through (espeak speech: first words at 1.5 s,
+final 0.5 s after the end; hands-free sentences at each pause; another origin gets 403; the browser flow works on the
+live URL). Not yet checked: a human voice on a real microphone.
+
+Export (Oct 27): edits accumulate in the scene's in-memory models (moves, offsets, trims, plans); export writes each
+edited discipline file once, with all its edits (a zip when several changed). Only kept fixes mark a file edited:
+`IfcScene.translate` no longer does (trials move and move back with it), `Workspace.apply` / `apply_offset` /
+`apply_trim` call `mark_edited`. Before, one tried move made export return an "edited" but unchanged file instead of
+409. Edits live in memory: a container restart or opening the models again starts clean.
+
+The view follows activity, not the tab (Oct 28): `viewPlan` in App.tsx. A plan (Fix button or chat) takes the view at
+once (old clash's highlight and marker cleared, then the plan's elements and fixes); picking a clash, proposing or the
+Clash tab gives it back; the Plan tab takes it again. A chat reply that built a plan and then points at a clash only
+selects it (`selectClash(c, keepPlan)`), and the list highlight follows the view. Before, a plan started from chat
+moved the camera but left the old clash highlighted and the plan undrawn until the Plan tab was opened.
+
+Bends (Oct 28): offsets turn with radiused 90° bend fittings by default, as Rev04 does (`edits.apply_offset(corners=)`,
+env `SIGHTLINE_OFFSET_CORNERS=square` for the old square corners). Pieces: straight, bend, riser, bend, middle, bend,
+riser, bend, straight (9; 7 when the rise leaves no riser). Bends are IfcDuctFitting / IfcPipeFitting /
+IfcCableCarrierFitting / IfcCableFitting, PredefinedType BEND, closed IfcTriangulatedFaceSet (8 facets per 90°), own
+placement, storey and systems, two ports each, chained into the run. Radius `edits.bend_radius`: one profile depth,
+less when the rise is short (min(depth, (rise - 40 mm)/2): Rev04's 180 mm duct, 100 mm tray, 54 mm pipe exactly); falls
+back to square when the bend would fold (inside radius < 5 mm) or the class has no fitting. Agent checks pieces[1:-1];
+`_describe` tells Muse the bend footprint. Answer key still 3/3 first try at Rev04 heights with bends.
+
+Joints and trims (Oct 27): `verify.check` also runs collision without touching, because the intersection query misses
+some overlaps (two boxes with flush faces: Clash7's transom 30 mm into a mullion came back as a 0 mm gap); depth is then
+the boxes' smallest overlap. Third fix kind **trim** (`edits.butt_trim` / `apply_trim`): cut a member's end back to
+butt the other's face. `edits.member_axis` finds the long axis, extrusion or rectangle profile (Northbank's transoms are
+1.65 m x 120 mm plans extruded 60 mm). A trim may touch its partner and only fails on contacts new or worse than before
+(`agent._try_trim`; plans the same). `_describe` says when a clash is at a joint. Replies carry `advice`; the UI shows
+it with what blocked the ideas when nothing passes (`NoFix`). Clash7: 86 s and 0/15 before, 13-23 s and a verified trim
+first try now. Answer key unchanged (3/3 first try, rows in results.csv). The viewer glows while the pilot drives.
+
+Reports and BCF (Oct 28): `server/sightline/document.py`, header **Report** (`web/src/ReportDoc.tsx`). Scope: one PDF,
+one per team or one per model (the user picks). Team per model is guessed from content (class histogram; name only
+breaks ties) and confirmed in the dialog. Acting team: whose element a fix changes, else triage's `responsible`, else
+structure stays > architecture > site, services move; every team with an element reviews. Real clashes and clashes with
+a fix get a page (Navisworks view cropped by colour, original + fix captured in the browser by `Viewer.capture` 1.4 s
+after an option is picked and at accept, Muse Spark's explanation marked AI-drafted, review table); model errors in a
+table for authors; noise grouped by test. DRAFT until each page has a review from every team involved (reviews:
+in-app `ReviewBlock`, name + decision, kept in localStorage per report; no login yet). BCF 2.1 zip: one topic per page,
+assigned to the acting team, comments = explanation + reviews, coloured pair and camera. Needs triage done; costs one
+proposal. HTML → PDF with WeasyPrint (Modal image apt-installs pango/harfbuzz).
+
+Not a clash (Oct 28): `web/src/noClash.ts` decides when a report clash needs no fix: same element (purple), a
+non-physical side (port, space, opening), a touch (|Navisworks| ≤ 1 mm and ORCA measures no overlap), no overlap in
+the open model, or triage by_design / non_physical. The clash panel then shows why and **Mark as not a clash**
+(a by-design review) in place of Propose fixes and Try a move ("Propose a fix anyway" overrides); list rows get a
+muted tag and cannot be ticked for Fix together. An ORCA overlap > 1 mm beats a 0 mm Navisworks touch.
+
+Triage knows what is settled (Oct 28): rule verdicts carry `basis` (non_physical / touch / same_element), an
+understanding that starts "Not a clash:" and names the elements, and a `fix_hint` with the clash rule that stops it
+coming back. With `scene_id` (stream and GET), `_triage_facts` settles one-element pairs from the open model: no model
+call, and `Job.learn` corrects a run that already asked, keeping the model's answer as `model_reading` (corrections go in
+before the replayed "done"). The browser overlays the rest (`shownTriage` in App.tsx): a model "real"/"model error"
+gives way to Mark as not a clash (`basis: reviewed`) or noClash's geometry (incl. ORCA's no-overlap measure), with
+the model's reading kept. Northbank on Muse Spark Open with the models open: 217 in 181 s, 111 settled (50 touch, 49
+non-physical, 12 same element), 106 asked.
+
+Guided tour (Oct 28): `web/src/Tour.tsx`, from the landing page (**Take the guided tour**) or the header (**Tour**).
+30 steps in 10 acts: the problem, triage (Muse Spark Open), one live fix (#042 duct: propose, pilot, before/after),
+"hold on" (the girder has two more), a trim (Clash7 transom, c0051, accepted), root cause via chat ("Why are there so
+many clashes on Level 02? Fix the root cause." → girder plan for duct + tray + CW, accepted), patterns (Explain, mark by
+design), your standard (Oct 29: Add to requirements on that pattern, open Requirements, L4, Strict with the expected
+count, the grid, Use them; targets `data-tour=add-requirement|requirements|req-levels|req-strict|req-grid|req-apply`;
+TourState `reqOpen`, `requirements`, `reqRules`; Escape closes the dialog, not the tour), sign-off (review on #042, Report, build), hand-off (PDF, BCF, Export IFC), close (numbers). Each step spotlights
+a real control (`data-tour` attributes) and moves on when the app reaches the state (`TourState`); "Show me" clicks it.
+Live Muse steps offer **Watch a recorded run** after 45 s (plan 75 s) or on error: real runs recorded on Oct 27 in
+`web/public/tour/` (c0053 18 s, c0051 trim 9 s, girder plan 35 s), replayed through the same pilot/plan code and
+labelled as recorded; accepting a replayed fix edits the model for real. `plans.root_causes(only=)`: a requested hub
+may have one clash left in the report plus geometry hits (the girder after #042 is fixed).
+
+Streams on Modal (Oct 28): Modal's edge zstd-compresses responses for browsers and held NDJSON streams back until a
+buffer filled: in the browser, triage sat at 0 for 77-170 s and Muse Spark's reasoning arrived with the result (local
+runs were fine: no edge). It ignores `Cache-Control: no-transform`; `app._ndjson` sends every stream with
+`Content-Encoding: identity`, which it passes through (first verdicts 0.5-2.5 s, proposal reasoning at ~4.7 s). Test
+a stream with `Accept-Encoding: gzip, deflate, br, zstd`, as browsers send.
+
+Triage reasoning (Oct 28): Muse Spark Open streams `reasoning_content` deltas on chat completions, from ~0.6 s, also
+with strict json_schema. `MetaChatModel.complete_json_streamed` reads them; `triage_report(reasoning=True)` (the shared
+`Job`) emits `{"type": "reasoning", id, text}` every 0.6 s per clash and keeps the whole reasoning on the verdict
+(`reasoning`, ≤ 6000 chars). `Job.follow` skips reasoning sent before a subscriber joined. UI: the Triage card's
+"Muse Spark Open is reading n now" (newest four clashes, the end of what it is writing, click to open) and "How the
+triage model reasoned" in the clash panel. The tour scrolls any target out of view (window or panel) into view once
+per element, including controls that appear later.
+
+Report and triage (Oct 28): the browser sends the verdicts it shows (`triage`, without reasoning) with a report
+request, and the server uses them over its shared run, which can be gone (restart) or running again (someone pressed
+Triage again): that left "Triage the report first" with no way out during the tour. The error now offers Triage all.
+Landing (Oct 28): hero = headline, lede, the two buttons side by side and a one-line load note, beside the before/after
+picture; "Once it's open" (left / middle / right) is its own three-card row.
+
+Triage and Insights UI (Oct 28): Triage leads the left panel. Before a run: "Step 1 · sort the report", one line on why,
+a full-width "Triage all n clashes". Running: two stages, "n settled by rule" (by basis: touch, same element, not physical; no
+model) and "Muse Spark Open has read k of m" with its own bar (verdict colours, the unread rest striped), then the live
+reading. Done: "n need a fix of N", the bar (a segment per verdict, click to filter), a row per verdict
+(name, what it means, count; click to filter; the real row is `data-tour=triage-real`), "Set aside n as noise" /
+"Flag n for their authors" (then a done chip), and a footer with time, rule count and model. Insights: header with
+counts in its subtitle, a purpose line per part, root causes with chips (clashing, level, across disciplines, not in the
+report), patterns as "11× Mechanical fastener with Plate" and one "Explain the n patterns with Muse Spark" button.
+Tooltips: `Tooltips` (ui.tsx) draws every `data-tip` in one fixed layer above the page, flips sides when there is no
+room and clamps to the window (was CSS ::after, cut off by panel and window edges).
+
+Not a clash, don't fix (Oct 28): c0087 (pad footing C1 vs ground beam grid C, -150 mm) got "trim the pad footing 900 mm"
+as a verified option: half the pad's bearing, which geometry cannot judge. `edits.butt_trim` now refuses anything not
+slender (`SLENDER = 3`: length at least 3x across, measured off its own mesh), and `_try_trim` marks a trim within one
+model `cleanup`; `_joint_text` tells Muse so. UI: "Model cleanup, not a coordination clash" with Mark as not a clash
+above such options, a "model cleanup" chip, "Accept this cleanup". Eval `evals/not_a_clash.py` (+ `not_a_clash.csv`):
+pad/ground beam, transom/mullion, beam/column: 3/3 by design, 0/3 touch what must stay, 3/3 cleanup only.
+
+Owner settings (Oct 28): `server/sightline/owner.py`. `SIGHTLINE_OWNER_TOKEN` (≥ 24 chars, in the `sightline-meta` Modal
+secret; never in git, chat or the browser's scripts). `POST /api/owner/unlock` checks it once (constant time; wrong
+tokens capped 5/hour per visitor, 50/day) and sets a signed cookie (HttpOnly, Secure, SameSite=Strict, Path=/api, 30
+days, keyed on the token: a new token logs everyone out); `/api/owner/lock` clears it. `_OwnerContext` (ASGI middleware)
+marks each request; only then is `X-Sightline-Settings` read (effort, triage_effort, no_caps) into context variables
+that `MetaChatModel.effort` uses (role "triage" for the triage model). `owner.spawn` / `owner.submit` carry them into
+stream workers and model-call pools. `_take` skips the demo caps for the owner. UI: `Owner.tsx`, a gear in the header
+for the owner, or on a page opened with `#owner`; chip "owner · effort …". When GitHub sign-in comes, `cookie_ok`
+becomes "signed in as an allowed login"; the rest stays. Historical validation: 79 server tests.
+
+See-through elements (Oct 28): web-ifc's style alpha now reaches the viewer. Each model has a second BatchedMesh,
+`glass`, for elements with alpha < 0.99 (a robot's restricted space, mesh guards, glazing), drawn without depth writes with
+per-element alpha (`setColorAt` with a Vector4); in focus they get a tinted see-through material. A pick takes the first
+solid hit and falls back to glass, so a zone does not swallow clicks on what stands inside it. Demo set 2 is
+the demo-models repo's `palletising-cell/` (PC-03: STEP + IFC, Rev A with five planted problems, Rev B fixed). ORCA's
+offset (C1), move (C2) and trim (C3) pass on it. (A move of something standing on the floor, the C5 HMI, used to fail
+because the check counted the floor contact: fixed Oct 30, "A move keeps what it stands on" below.)
+
+ORCA detection (Oct 28): design in `docs/detection.md`, code `server/sightline/detect.py`; no Navisworks report
+needed.
+- **Default tests:** every pair of model files, each file against itself (one model alone is named after its file),
+  and duplicates. Hard tests use 1 mm.
+- **Never a clash:** rules for same element, joined by ports, one assembly (aggregates/nests) and door in its wall
+  (`IfcRelFillsElement`). These, and touches, are counted per test, not reported.
+- **Engine:**
+  - a sort and sweep over `IfcScene.bounds()` (the completeness argument);
+  - one triangle tree per run: intersection, then collision without touching;
+  - `_Solids`, an exact separating-axis depth for rectangular extrusions, which also catches fully flush overlaps
+    that both queries miss;
+  - `model-offset` towards the middle when the federation lies over 200 m from the origin (the tree drops overlaps
+    there);
+  - one result per pair, capped at 5,000 per test (`partial`).
+- **Depth:** how far one must move to clear the other. Exact for rectangular solids, else min(intersection figure,
+  box separation). The intersection figure alone is wrong both ways: a 0.5 mm touch read 200 mm, a 40 mm rail read
+  20 mm. So #057 now reads −100 mm and #061 −77 mm (−400 mm was the old figure).
+- **Ids and reruns:**
+  - Ids are `s` + a hash of the test and the GlobalId pair, so they are stable.
+  - `Workspace.detect` keeps the last run per scene: a rerun marks clashes new or active and lists resolved only
+    when both elements were still checked.
+  - Views and "not a clash" marks carry over to a rerun.
+  - The report has `origin: "sightline"` and `temporary=True` (its own run folder).
+  - The clash panel's "Now" uses `detect.measure_pair` for these reports.
+- **API:**
+  - `GET /api/scenes/{sid}/detect/tests`;
+  - `POST /api/scenes/{sid}/detect/stream` (NDJSON: phase, start, test, test_done, done; cap
+    `SIGHTLINE_DETECT_PER_HOUR`/`DAY`);
+  - `POST /api/reports/{rid}/clashes/{cid}/images` (A/B/C PNGs captured in the browser by `Viewer.captureClash`,
+    then used by the agent, triage and the PDF);
+  - chat tool `detect_clashes`.
+- **UI:**
+  - `Detect.tsx`: a setup card when models are open and no report is, and a summary card over a detected report
+    (coverage table, resolved/new chips, Detect again);
+  - "Find clashes in the open models" in the Clash report menu;
+  - "Found by ORCA" / "Now" in the clash panel;
+  - chat-run detection adopts its report without remounting the chat (`chatReport`).
+- **Evals:** Northbank, 633 clashes in 7-12 s; 117/117 of the sampled real Navisworks overlaps; answer key 3/3
+  (Navisworks has no #061). Cell: Rev A 13/13 planted, 0 unexpected; Rev B 0.
+- **End to end in the browser:** detect → #061 → views captured → Muse Spark proposed "up 280 mm through the beam
+  opening" (Rev04's height) in 44 s → accept → Detect again: 1 resolved, 0 new.
+- **Tour and landing:** now on detection (below).
+
+Clash numbers and titles (Oct 28): no "Clash39".
+- **Numbers:** every clash has `number`, shown as #N, unique across the whole report (not per test).
+  - Navisworks reports number by position, so c0053 is #53. Their own label is kept as `ref` and shown as a small
+    reference ("Navisworks Clash1") in the panel and the PDF.
+  - Detection numbers are stable across reruns (`state["numbers"]`): a new clash takes the next number, and a
+    resolved clash's number is never reused.
+- **Names:** `name` is now the plain name from the two elements (`reports.plain_name`: "A × B"). `label` is
+  "#N title-or-name".
+- **Titles:** `titles.py` with `domain_packs/titles.md`.
+  - The triage model (Muse Spark Open) titles every clash from text facts, 40 per call, 8 calls at a time, with
+    strict JSON. Northbank's 633 detected clashes take 60 s.
+  - `POST /api/reports/{rid}/titles/stream` runs one shared job per report (`_title_jobs`, keyed like triage; cap
+    `SIGHTLINE_TITLES_PER_HOUR`/`DAY`). `GET .../titles` returns them.
+  - The browser starts titling as soon as any report opens. Titles stream into the list ("Muse is naming n…") and
+    are carried to reruns by id.
+  - The prompt says "modelled twice" only in a duplicates test. Muse first called Northbank's X-brace diagonals (same
+    name, same box, 3 m apart in shape) duplicates. Insights' Oct 27 "duplicate braces → modelling error" is likely
+    the same misreading.
+- **Everywhere else:**
+  - `Report.clash()` accepts "#39" and "39", so chat tools and voice can use numbers; chat refers to "#39 title".
+  - Voice keywords are element names and titles, not clash names.
+  - PDF and BCF titles use the label.
+  - The tour finds its clashes by element pair (below), not by number.
+- **Web tests:** `web/tests/app-host.mjs` and `app-replacement.test.mjs` stub App's imports. A new import in App
+  needs adding to both lists, or `npm test` fails to resolve it.
+
+Coordination first (Oct 28, owner decision): ORCA's own check is the golden path; Navisworks is secondary.
+- **Wording:** "design coordination" for the job and its outputs, "clash" for one geometric item. Landing hero "An AI
+  design coordinator for 3D models"; header menu **Coordinate** ("Check the open models" first, then "Or import a
+  Navisworks clash report"); Detect card "Coordinate the models"; a run's report "Coordination · N models"; PDF "Design
+  coordination report"; chat prompt "design coordination app". Code identifiers stay `clash`/`report`; BCF TopicType
+  stays "Clash". Navisworks stays named where it is a fact: an imported clash's reference, the BCF tools list, the
+  README's "Works with Navisworks reports", the recorded plan's cause text.
+- **Golden path:** "Open the Northbank demo" / "Watch ORCA fix a clash" open the four models and run the check
+  (`openDemo` → `runDetect(null, id)`); the golden path then opens the duct × girder clash (#1) and proposes. Measured:
+  list at 22 s, Muse's first idea (+400 mm offset through the web opening, Rev04's height) verified at 42 s into the
+  proposal, so the landing says "~40 s to a verified fix" (the old 15-25 s was the imported report).
+- **Tour:** `TOUR.duct` / `TOUR.joint` are GlobalId pairs; `clashOfPair` in App.tsx finds them in whatever report is
+  open (detected: #1 and #15). Step targets may be functions of `TourState` (`duct`/`joint` carry id and number). The
+  recorded runs (`web/public/tour/`, recorded on the imported report as c0053/c0051) are fetched by role; the girder
+  plan's clash ids are re-pointed by element pair at replay (`replayPlan`), so "not in the report" reflects this report.
+- **Triage of a detected run:** 633 clashes, 98 model calls (alike groups read once), 214 s on Muse Spark Open; 13 real
+  (answer key 3/3 real, high, MEP; the B1 pad footing vs lift-pit wall; site trees and paving), 491 by design, 128
+  model errors. Landing: "7 s to check 1,961 elements", "633 clashes sorted in 3½ min". The clash panel says when a
+  verdict was "read once for n alike clashes".
+
+Header, thumbnails, Site (Oct 28):
+- **Header:** the name is "ORCA", centred with the logo (`.bar` is a three-column grid:
+  `.bar-side`, brand, `.bar-side.end`). No model names or report title in the header; the element count sits after
+  Models. Below 1280 px, How it works and Tour drop their text labels (`.lbl`).
+- **List thumbnails for detected clashes:** they have no pictures until opened, so `Viewer.thumbClash` draws a small view A
+  (JPEG) off screen in one task, as a row scrolls into view (`LazyThumb` in ReportList.tsx; queue in App.tsx, one per
+  frame, newest first, paused while a proposal, plan, replay, reload or check runs). `captureClash` and `thumbClash` share
+  `Viewer.posed`.
+- **Site out of the default check:** tests involving a Site model are listed but off; duplicates cover the building
+  models. Northbank: 464 clashes in 1,732 elements, ~4 s; triage 39 calls, 101 s, 5 real (answer key 3/3). Landing and
+  tour numbers follow.
+
+Owner and everyone settings (Oct 28, owner decision): the open-weights model costs per hour on Baseten, so it is off
+unless switched on. `server/sightline/settings.py` holds settings for everyone (open_weights, effort, triage_effort;
+None = environment default: `SIGHTLINE_OPEN_WEIGHTS` "0", `META_REASONING_EFFORT`, `TRIAGE_REASONING_EFFORT`), stored
+in the Modal Dict `sightline-settings` (when `MODAL_TASK_ID` is set) else `SIGHTLINE_SETTINGS_FILE` (default
+`server/.sightline-settings.json`, gitignored). Precedence: the owner's header > everyone's > environment
+(`MetaChatModel.effort`, `settings.open_weights()` → `triage_model()`; off = Muse Spark with a note). Owner-only
+`GET/PUT /api/settings`. UI: Owner menu "For me" / "For everyone"; header chip shows the owner's open-weights override.
+Tests use a per-test store (`tests/conftest.py`).
+
+Insights, Triage, thumbnails (Oct 28, owner feedback):
+- **Copy follows the active model:** `GET /api/models` (`meta_client.triage_model_info`, the same decision
+  `triage_model` uses) tells the browser whether titles and triage run on Muse Spark Open or Muse Spark; the Triage
+  card, tour and landing say which (`triageOpen`). The landing's 464-in-2-min stat says it was measured on Open.
+- **Insights doesn't jump:** patterns are read once per report and show their open clashes from `resolved` (a pattern
+  with none left stays in place, dimmed, with a ✓); root causes are re-read but keep their places (`keepPlaces` in
+  App.tsx; a hub that drops out stays as a "Done" row). Action columns and the count chip have fixed widths so a
+  change never reflows a row. Checked: rows' tops and heights identical before and after marking a pattern.
+- **Filter to a pattern or root cause:** the funnel button sets `listFocus` (App.tsx) → ReportList shows only those
+  ids with a chip ("Pattern: Beam with Beam · 133 of 133 shown ✕"). One filter at a time: it and the triage filter
+  clear each other.
+- **Compact Triage:** a chevron collapses the card to the count and the bar (segment tooltips carry verdict, meaning
+  and the click; an info icon carries time, rule count and model). Compact by default once a run is done; the choice
+  is kept (`sightline.triage.compact`). In compact the red segment is the tour's `triage-real` target.
+- **Thumbnails flashed in the viewer:** `thumbClash` renders into the visible canvas (`preserveDrawingBuffer`), and a
+  shot taken after the frame's own render showed until the next frame. `Viewer.posed` now renders the restored view
+  before returning; the queue draws one thumbnail per 60 ms (setTimeout). Checked by sampling the canvas between frames
+  while scrolling: the old build jumped 45 levels of brightness, the new one 0.
+- **Patterns are read automatically** once per report and models (`explainPatterns(quiet)` in App.tsx, skipped while
+  a proposal, plan or replay runs; a failure leaves the Explain button). Their mark / flag / fix buttons need that
+  reading, which is why they seemed missing. Northbank: verdicts ~35 s after the list.
+- **A filter gives the list the room:** with a pattern or root cause filter on, Triage goes compact unless opened for
+  that filter (`forceCompact`). (Superseded Oct 29 by the Clashes / Insights tabs, below: Insights and the run's
+  summary now live in their own tab.)
+
+STEP models (Oct 28, owner decision; design in `docs/step.md`, code `server/sightline/step.py`):
+- **Conversion:** STEP → IFC on open (`cadquery-ocp` 8.0 in the same process as IfcOpenShell: checked, no conflict).
+  Parts become triangulated elements with name, colour/alpha, pset `ORCA_STEP` (Group, Label, Source); groups
+  become IfcGroups, not assemblies; GlobalIds from file hash + label path.
+- **Classes:** the titles' model picks each part's class from name and group (`domain_packs/step_classes.md`).
+- **Cache:** by file hash (`samples/step-cache` is deployed so the demo's first opening is ~1.5 s, not ~35 s).
+- **Fixes:** moves only. `IfcScene.step_run`: parts of the same STEP group that touch move together.
+- **Export:** writes `<name>.orca.step` back (`step.export`, component locations), zipped with the IFC.
+- **Upload:** `POST /api/models/upload` (IFC/STEP, caps `SIGHTLINE_MODEL_UPLOAD_MAX_MB`,
+  `SIGHTLINE_MODEL_UPLOADS_PER_HOUR/DAY`); Models › Upload models.
+- **Second demo:** the landing's "A machine cell, from its STEP file" (`cellSample`, `openDemo([cellSample])`).
+- **Results (`evals/step_cell.py`):** Rev A 144 parts, classes 144/144, 13/13 planted, 0 unexpected; Rev B 0 planted;
+  C2 ladder +150 mm verified and written back. In the browser Muse Spark proposed exactly that move.
+- **Modal image:** needs `libgl1` for OCP.
+
+Cell fixes and tour (Oct 28, owner feedback on Fix together for #61/#68: two agents, both failed, a wall of text):
+- **Exact STEP bars and rods:** `step._prism` writes plain cylinders and boxes as `IfcExtrudedAreaSolid` (cell: 97
+  exact, 47 meshes), so offsets and trims work on STEP parts. Export now replaces changed prototypes and adds new pieces
+  (offset middles, risers, bends) to the part's group with its name and colour (`service.step_changes`; docs/step.md).
+  Place shapes with `BRepBuilderAPI_Transform`, never `.Moved()` (names and colours are lost on write).
+- **One problem, one agent:** `plans.merge_shared` merges Fix-together pairs that share a movable element into one item
+  (`others`), and the agent is told every obstacle. A shared fixed element (the girder) is not merged.
+- **No trimming guarding for a service:** `_try_trim` refuses to trim a fixed element when the other side can move (the
+  first ladder recording cut post W5 down to the tray).
+- **Plain-words failures:** `plans.failure_summary`: one line per idea ("up 150 mm: hits …", by name) plus the advice;
+  the Plan panel lists them and says "Nothing to accept yet" when nothing verified.
+- **Cell tour:** `CELL_STEPS` in Tour.tsx (12 steps), from the landing's **Take the cell tour** or the header's Tour
+  when the cell is open (`tourWhich`). Clashes found by part names (`CELL`, `clashOfNames`); recorded runs
+  `web/public/tour/cell-ladder.json` and `cell-pipe-plan.json`.
+- **Eval:** `evals/step_cell.py`: C1 one job, verified; C2 +150; C3 trim 40 mm; exported air line 7 → 15 parts.
+
+Landing demo cards (Oct 29, owner decision): the hero keeps "Watch ORCA fix a clash" and a "Pick a demo" link; below
+it, two equal cards (`DemoCard` in About.tsx: picture, what it is, what it shows, measured chips, Open + Tour; the
+`data-tour` demo/cell targets moved with their buttons). The README's "Two demos" table uses the same pictures and
+numbers: change both together. Pictures are captured in ORCA's own viewer (not the DemoModels renders, which
+predate the event) by `web/scripts/capture-demos.cjs` → `web/public/demos/*.webp`; recapture after visual changes.
+
+Agents over MCP (Oct 29, owner decision; docs/mcp.md):
+- **Connect an agent:** a pairing link (`agents.py`: `orca_` token, sha256 kept, 12 h sliding, 24 h max, revocable,
+  in memory) ties an MCP client to the visitor's session.
+  - The page PUTs its context (scene, report, clash, fixed) and follows `GET /api/links/{token}/events` (NDJSON,
+    reconnects every 4 min).
+  - Events: the chat's ui events, plus `open_models`, `applied`, `follow_triage`, `capture_request`, `agent_call` /
+    `agent_result`.
+  - UI: `web/src/Agent.tsx`, the header button and pill. Handled by `onAgentEvent` in App.tsx, which reuses
+    `onChatEvent`.
+- **The MCP server:** `mcp_server.build(ws | getter, Hooks, local=)`, 28 tools.
+  - It reuses `chat.Chat._run` (one tool layer with the chat), plus session, pictures, jobs, apply_fix / apply_plan,
+    triage, report and export.
+  - Remote at `/mcp`: a Starlette `Route` inserted first, `_McpGate` (401 without a live token, `?key=` → header,
+    `Content-Encoding: identity`).
+  - Stateless with JSON responses. A new session manager per lifespan (`_mcp_transport`; it runs only once).
+  - Stdio: `python -m sightline.mcp_server`, with its own local link.
+  - Expected failures are `ToolError`s, so the agent reads why.
+  - Long work is a job (`wait_s`, then `get_job`).
+- **Caps:** `SIGHTLINE_LINKS_PER_HOUR`/`DAY`, `SIGHTLINE_AGENT_CALLS_PER_HOUR`. Proposals are charged to the link's
+  creator, and the owner's links have no caps.
+- **Measured (local):** a real `mcp` client plus a browser on the same link ran #58 end to end:
+  - show → A/B/C taken by the page in 8 s → capture_view → propose (an offset, verified, 28 s) → apply_fix;
+  - the page shows "1 fixed".
+
+  Stdio opened the cell from STEP.
+- **Later:** accounts (GitHub sign-in) and saved projects; OAuth on `/mcp` for claude.ai connectors.
+- **Time left and resume (Oct 29, owner feedback):**
+  - **Time left:** "expires 06:49 PM" had the creation time's clock digits (12 h later), and it never refreshed. The
+    dialog now shows time left ("11 h 52 min left", the exact time in a tooltip, "expiring soon" in the last 30 min),
+    on the server's clock (`server_time` → `clock_offset`).
+  - **Kept current:** from `hello`, each `agent_call` (`expires_at`), and `GET /api/links/{token}` every 60 s. That
+    GET does not renew; a context PUT or an agent call does.
+  - **Resume:** the session (scene, report, files, fixes, link) is kept in `localStorage` (`sightline.session`), and
+    the landing shows "Pick up where you left off" while `GET /api/scenes/{id}` (`Workspace.scene_info`: files,
+    STEP names, last detection) answers.
+    - `resumeSession` reopens it through `open(files, existing)`, plus `loadReport`, the saved fixes and the
+      fixes the link's agent applied while no page was open (`Link.applied`), and reattaches the link.
+  - **A closed tab** doesn't stop the agent: `get_session` adds a note naming the page-only tools.
+  - **Eviction:** `Workspace.keep` (live links' scenes and reports, `Links.kept`) is evicted last. Modal
+    `max_inputs` is 64.
+  - **Muse Code:**
+    - the dialog's first tab: the settings JSON only (`muse mcp add` does not exist: "unknown muse mcp subcommand",
+      owner, Oct 29) (`~/.config/muse/settings.json`, `schema_version` 1, `mcpServers`, `"mode":
+      "optional"`, because `required` aborts runs when a link expires);
+    - read tools carry `readOnlyHint`, so Muse Code runs them without approval prompts;
+    - Muse Code supports OAuth (`muse mcp login`), which fits the later OAuth work.
+  - **Token on its own (Oct 29, owner):** the dialog leads with Token (masked, show, copy) and Server rows (`CopyField`
+    in Agent.tsx); only the token changes between sessions. The client settings sit under "First time? Set up your
+    agent", open until this browser has made a link (`sightline.agent.setup`). Muse Code's tip: `"Bearer ${ORCA_TOKEN}"`
+    once, then only the env var changes.
+  - **Resume card:** `.about section` (a column, centred) had swallowed the card's row layout, so it is a `div` now.
+    - Layout: one row with an icon, the text, then Resume / Start fresh; it stacks below 560 px.
+    - Title: the project name from the files' shared prefix (`projectName`: "Northbank"), with chips for models,
+      clashes, fixed, and "Agent connected · time left".
+    - Start fresh also revokes the saved link.
+
+Coordination requirements (Oct 29, owner decision; design in `docs/requirements.md`, code
+`server/sightline/requirements.py`, `web/src/Requirements.tsx`, `web/src/reqFile.ts`):
+- **What it is:** an optional `orca-requirements/1` JSON file: a design level (L1 Concept to L5 As-built, industry-neutral,
+  RIBA/LOD/product phase only as hints), a strictness (lenient to exacting; covers both flagging and fixing; strict
+  fixes cautiously), groups (by team, class, system or file, never GlobalId), a check matrix (hard, clearance, off),
+  who moves (edits any/move/none, largest move, trims), by-design class pairs, and guidance for Muse. No file means
+  today's behaviour exactly.
+- **What it compiles into:** detection tests (`req:a|b`, plus the new `Test.min_size_m`); triage rules (`basis:
+  requirement`), the strictness overlay (a low-confidence by-design becomes real under Strict) and prompt lines; and
+  `Workspace.fix_settings` (clearance, `Policy`, prompt lines, recommend mode) for proposals, plans and root causes.
+  `context_eval` keeps a never-edited group fixed.
+- **Muse stays in the loop:** it drafts a file (`POST .../requirements/suggest`, one proposal), reads what no rule
+  settles, audits each by-design rule after triage (`triage.audit_rules`; a disputed rule marks its clashes), and
+  recommends instead of editing where nothing may be edited (`agent._recommend`). Options carry `meets`.
+- **Triage prompt says only what differs from the defaults.** L3 Balanced adds nothing. Measured: "every hard clash
+  matters" in the L3 line turned Muse Spark's 12 model errors into 80 on Northbank.
+- **Plumbing:**
+  - Pages register a file (`POST /api/requirements`, content-addressed) and send `X-Sightline-Requirements` with
+    every call; a forgotten id is a 409 `requirements_unknown`, and `api.ts` registers again and retries.
+  - Triage jobs are keyed by `model_key` + `rules_key`. A rule change continues from the last run's readings for
+    free; another prompt shows the last run as `stale`, with today's rules applied.
+  - Agent links carry the page's id.
+  - `GET /requirements/scale`, `GET .../requirements/default`, `POST .../requirements/preview` (detection without a
+    report, cached; caps `SIGHTLINE_REQUIREMENTS_PER_HOUR`, `SIGHTLINE_PREVIEW_PER_HOUR`).
+- **UI:** header **Requirements** (the pill shows "L4 · Strict"). The dialog has level cards, a strictness slider with
+  what it sets and the expected count, the grid, who moves, rules with Muse's audit, guidance, Suggest with Muse Spark,
+  Download / Upload / Start from the models, and "Use them and check again". Insights has **Add to requirements** on
+  by-design patterns. Detect and Triage cards say what they ran under, and a recommendation shows in the clash panel
+  and the PDF.
+- **Measured (Northbank, Muse Spark):**
+  - L3 Balanced 464 = 464 (cell 107 = 107, same pairs); L4 Strict with Muse's draft 830.
+  - Muse's L4 Strict draft took 36 to 85 s: structure never edited, MEP 50 mm to structure, six by-design pairs.
+  - #1 under Strict: offset +400 mm through the web opening, 50 mm ≥ 40 mm required, within the 400 mm limit.
+  - L5: the same change recommended, nothing edited.
+  - Add to requirements on "Beam with Column": 102 settled at once.
+- **Web tests:** `requirements.test.mjs`; App's new imports are in both stub lists (`setRequirements` is in the api
+  stubs).
+
+Small models and a blank project (Oct 29, owner feedback on an uploaded ~100 mm load-cell STEP: a huge clash ring,
+framing far out, thumbnails with the part a speck):
+- **Viewer distances were building-sized floors** (0.5 m least margin and `2r + 0.5` in `zoneCamera`, 1.5 m in
+  `flyToBox`, 2 m in `view`, the marker's 0.3 scale floor, 2.5 m context, 4 m / 1 m section box, 1 m / 0.6 m fallback
+  zones, a 10 mm near plane). Now `Viewer.reach(metres, share)` keeps each building value but never more than a share
+  of the scene's diagonal (`sceneDiag`, cached per load), and `zoneCamera`'s least margin is also bounded by the pair
+  (a quarter of their union, twice the zone). The marker keeps a constant screen size (no floor), the near plane goes
+  down to 0.5 mm. `posed` uses `zoneCamera`, so A/B/C pictures and list thumbnails follow.
+- **Checked:** a generated 5-part load cell (110 mm, 2-12 mm overlaps; the appmeas.co.uk zip sits behind a Cloudflare
+  challenge here) frames the shaft and nut filling the view, thumbnails readable; Northbank #1 and #40 frame as before.
+- **Blank project:** the landing hero's **Use your own models** (`onBlank`, `data-tour=blank`) opens the workspace with
+  `ProjectStart.tsx` in the stage: a drop zone / Choose files for IFC or STEP (→ `openDemo(files)`: upload, open, check),
+  Import a report folder, Back to the demos. `landing` is `!stats && !report && !blank`; Tour hides until something is
+  open; on a phone the bottom sheet stays away (`starting`) until something opens.
+
+Next, in order.
+1. ✅ Spike 4 passed with images (spikes/README.md). ✅ Opening heights fed as text (`edits.passages`).
+2. ✅ Local-offset edit, verified on #042/#057/#061 at Rev04's heights. ✅ Bends. Later: sideways offsets, splitting
+   at fittings.
+3. ✅ Viewer: context/x-ray modes, section box, measure (above). ✅ A/B/C capture in the browser (detected clashes).
+   Still to do: plan view.
+4. ✅ Agent loop end to end in the UI, streamed. ✅ Chat panel with tools. Later: expose the report tools on the MCP
+   server too.
+5. ✅ Bulk triage, live on Muse Spark Open (Baseten). ✅ Voice. ✅ Export IFC. ✅ PDF reports + BCF. ✅ ORCA
+   detection (no Navisworks needed). ✅ #N numbers and Muse titles. ✅ Demo, tour and landing on detection. ✅ STEP
+   models and the palletising cell (from STEP) as the second demo.
+6. ✅ Escalating to Muse Wonder (`docs/escalation.md`) and ✅ Show it built (`docs/show-it-built.md`), both below.
+   Muse Image cannot design a fix (Oct 29: it redraws the geometry and invents numbers); it only restyles one.
+7. Freeze Nov 3, record video; submit Nov 4 before noon ET.
+
+Later (not in the hackathon build): user accounts and saved projects; STEP machines placed inside building models;
+offsets and trims on meshed STEP parts.
+
+Phones and tablets (Oct 29, owner decision; design in `docs/mobile.md`, code `web/src/layout.ts`, `Sheet.tsx`,
+`AppMenu.tsx`, CSS "Responsive" at the end of `index.css`):
+- **Layouts:** above 1100 px the desktop as before (checked box for box against `main` at 1280/1440/1920). 761-1100 px
+  a tablet: model + right pane, the clash list a drawer (header **Clashes**). 760 px and below a phone: the model full
+  width with a bottom sheet (peek / half / full) holding Clashes · Fix · Plan · Chat over App's own panes (re-placed
+  by CSS, never remounted), and a peek line with the one next step (Propose fixes, Accept, Next clash). Header actions
+  sit in **Menu** (`MenuSheet`); the header's Models / Coordinate bodies are shared render functions, so tests that
+  open those popovers still work.
+- **The sheet follows activity** (`follow()` in layout.ts, one effect in App.tsx): report or models open → list;
+  a clash picked → Fix at half; proposing or planning → peek (watch the pilot); the result → half, scrolled to the
+  options. Moving it by hand wins until the next event.
+- **Touch** (`(pointer: coarse)`, any width): 44 px targets, tap an element for its card (Set as A / B, then a "now
+  pick B" toast), long press picks A then B, the rail becomes **Tools** + Go to clash + Fit on a phone, press and hold
+  any `data-tip` control to read it (`data-tip-tap` shows on a tap), popovers open as bottom sheets, dialogs go full
+  screen with a pinned title, the requirements matrix and tables stack, the lightbox swipes, hints say tap.
+- **Tour:** picks the visible copy of a target, `TourActions.reveal` opens the sheet tab / drawer / menu that hides
+  it, docks its card above or below on a phone, and says tap.
+- **Checked:** Playwright profiles iPhone 13 / SE, Pixel 7, iPad Mini (both ways), desktop: no sideways scroll, no
+  unnamed or undersized control on touch profiles, and the golden path by touch (live proposal, accept, Next clash).
+- **Web tests:** App's new imports (`./layout`, `./Sheet`, `./AppMenu`, icons `List`, `Menu`) are in both stub lists;
+  `tests/layout.test.mjs` covers the breakpoints, snapping and `follow()`.
+
+Insights patterns (Oct 29, owner feedback): each pattern is a card: the count and the pair on one line
+(`.pattern-head`), the levels/size line, Muse's verdict and the rule across the card (`.insight-more`), and a foot
+with Add to requirements and the buttons (`.pattern-foot`), so the pair's name no longer wraps beside the buttons.
+
+Room for the list (Oct 29, owner feedback: "we can barely see one clash"): the left pane over a report has two tabs
+(`ReportList` `view`, `leftView` in App.tsx). **Clashes**: the report title and test count, Triage folded to one
+line (before a run its button sits in the head; after, "7 need a fix of 464" and the bar; it opens while running),
+the search with its filters on one row, and the list, which scrolls on its own (min 200 px). **Insights**: the impact
+line, the run's summary (Coordinate the models, Detect again, coverage) and Insights. Insights no longer narrows to the
+filtered row; its filter and tick buttons switch to Clashes. The tour's `reveal` switches the tab on every layout. On a
+phone the report title row is hidden and the sheet's status line hides at full height when it has no button.
+Measured, list top / clashes in view: desktop 1440x900 from below the fold to 275 px / 14; iPhone 13 at full from 1
+row to 6.
+
+Renamed to ORCA (Oct 29, owner decision; was Sightline). Everything people see or get in their files says ORCA: the
+app, the PDF and BCF, the MCP server name `orca`, export names `<name>.orca.ifc` / `.orca.step`, the STEP pset
+`ORCA_STEP` (`scene.step_source` also reads the old `Sightline_STEP`, so older caches still open), and the Modal app
+`orca`. **Internal names kept** (renaming them would break deployed config or saved state): the Python package
+`sightline` (`server/sightline`), env vars `SIGHTLINE_*`, the Modal secret `sightline-meta` and Dict
+`sightline-settings`, the header `X-Sightline-Settings`, the owner cookie `sightline_owner`, browser storage keys
+`sightline.*`, a report's `origin: "sightline"`, and the model convention `Pset_SightlineConstraints`.
+
+Fix kinds in one registry (Oct 29, owner decision; design in `docs/edits.md`): groundwork for reroute, resize and
+penetration requests (planned, in that order, in `docs/edits.md`).
+- **Registered once per layer:** `agent.TRIES` / `agent.PARAMS` (try an idea), `plans.IN_TRIAL` / `plans.EXTRA_FILES`
+  (a plan's joint check), `plans.KEEP` behind `plans.apply` (keep it; the plan, MCP `apply_fix` and the new
+  `POST /api/scenes/{sid}/fix/apply` all use it), `requirements.SIZED` / `change_size`, and `web/src/fixKinds.ts`
+  (name, edit text, clearance, framing, review). A kind nobody registered is refused ("unknown kind"), never tried as
+  a move.
+- **Newer kinds** carry `edit` (parameters, `summary`, `key`) and `review` (who must review before building).
+- **Ranking:** `agent.TIERS`: plain geometry fixes, then resize, then penetration; a round with only those doesn't
+  end the search.
+- **Several obstacles:** `Clash.others` (a plan's merged item): placed along the run in Muse's text, and a split run's
+  end pieces are checked against all of them (before, only the first). Failed attempts tell Muse where they hit
+  (`Attempt.where`).
+- **Fixed on the way:** the "largest move" limit measured a lateral offset as 0 mm; it now measures how far it goes.
+- **Checked:** answer key 3/3 first try at Rev04 heights (rows in `evals/results.csv`); 399 server tests, 53 web tests.
+- **Web tests:** App imports `./fixKinds`; both stub harnesses compile the real module (`compiled("../src/fixKinds.ts")`).
+
+Reroute (Oct 29, owner decision; design in `docs/edits.md`, code `edits.apply_route`, `agent._try_route`): the fourth
+kind of fix, for what one offset can't pass.
+- **Shape:** `{"kind": "route", "steps": [{from_m, to_m, up_m, side_m}]}`, up to 3 steps on the run's own axes
+  (`edits.run_frame`: up square to the run; side = left of its direction, named by compass in Muse's text). Steps that
+  share a boundary change straight from one offset to the next; each change is one axis (a round pipe may roll: both
+  at once). One step straight up is tried and kept as an offset.
+- **Geometry:** 90° bends and risers per change (`bend_radius` on its own jump, the section's size in its own plane;
+  square corners for the whole route if any bend would fold). `_build_chain` (moved out of `apply_offset` unchanged)
+  chains copies, fittings and ports for both; a one-step route builds exactly the offset's meshes. Slopes up to 15°
+  keep their fall; vertical runs and falling drainage are refused; level drainage only steps sideways (`is_gravity`).
+- **What Muse reads:** `edits.free_bands` (room beside or above each obstacle, clear of everything along that stretch:
+  rays round the profile's outline every 30 mm, a ray inside a solid counts as blocked, only bands reachable from the
+  line count), "no side offset clears all of them in one stretch" when only separate detours fit, and for a single
+  report clash the movable element's other clashes within 3 m (`Workspace._nearby`, told, never required; never the
+  fixed side's partners). Prompt: `construction.md` "route".
+- **Everywhere:** `TRIES`/`PARAMS`/`IN_TRIAL`/`KEEP` entries, `Workspace.check_route`/`apply_route`, chat and MCP
+  `check_route`; the page needed nothing new (slice 0's `fixKinds.ts` and `/fix/apply`).
+- **STEP:** `IfcWall` is now a class STEP parts may take (`step.CLASSES`, `step_classes.md`).
+- **Demo case:** the cell's C6 (demo-models repo, Oct 29: plant walls drawn see-through, columns C3/C4, PL-302, ES-2;
+  Rev A 159 parts, 16 planted pairs). Only a detour round each column clears.
+  - In the browser, a single proposal on #22 (PL-302 × C3) got "Reroute pipe north past C3 and C4" (250 mm round each,
+    53 mm clear) in 37 s, accepted through `/fix/apply`.
+  - `evals/step_cell.py`: C6 Fix together → one job, a verified route in 31 s; classes 159/159; 16/16 planted.
+- **Checked:** answer key still 3/3 first try at Rev04 heights; 418 server tests, 53 web tests; landing and README cell numbers and
+  `web/public/demos/cell.webp` updated.
+
+Accept in place (Oct 29, owner decision; `docs/edits.md` "Keeping a fix"): a kept fix no longer reloads its file.
+- **Server:** apply replies and the link's `applied` event carry `Workspace.patch` (`scene_id`, `revision_before`,
+  `revision`, `meshes` from `edits.meshes(render=True)`: unwelded, normals, style colour and opacity, file); every apply
+  reports `changed`. Open, upload and scene-info replies carry `revision`.
+- **Page:** `applyToViewer` (App.tsx) patches through `Viewer.patch` → `viewer/patch.ts` when the page is at
+  `revision_before` (`sceneRevision` ref), else reloads the changed files as before. Batches keep spare room
+  (`patch.ROOM`); `makeRoom` packs, then grows ×2; new pieces take their mesh's colour, else their origin's; a
+  see-through piece makes the model's glass batch when it has none.
+- **Checked:** Northbank golden path and the cell's route accepted with no file download (headless Chromium); 4 server
+  tests (`test_accept_in_place.py`), 3 web tests (`viewer-patch.test.mjs`, real three.js batches). Web test harness:
+  `viewer-load.test.mjs` compiles the real `./patch`.
+
+Penetrations (Oct 29, owner decision; design in `docs/edits.md` "Penetration", code `edits.penetration` /
+`apply_penetration`, `agent._try_penetration`): the fifth kind of fix, an opening asked for where a straight service
+crosses a wall or slab.
+- **Hosts:** `IfcWall` / `IfcSlab` with extruded bodies only. Beams, columns, footings, piles, members, doors, windows
+  and curtain walls are refused (the girder is never cut); so is a hole the host would not surround by 50 mm.
+- **Opening:** the section + clearance + 5 mm all round, rounded up to 10 mm, round or rectangular, square to the
+  service, through the host's depth (rays from both faces) and 10 mm proud. Cell C7: Ø130 mm, 220 mm deep.
+- **Always a provision for void** in the service's model (`IfcBuildingElementProxy` PROVISIONFORVOID; IFC2X3 by
+  ObjectType; `Pset_ProvisionForVoid`; see-through orange). It is never physical (`scene.not_physical`: no box, not
+  in `products()`). **The opening** (`IfcOpeningElement` voiding the host) is cut in trials always, and when kept only
+  with no requirements or when the host's group may be edited (`requirements.can_cut`); otherwise `cut: false`,
+  `blocked_by`, the clash stays open and the page records "Opening requested" (evidence "recommended"; PDF "Opening
+  requested"; plans and MCP report `not_cut`).
+- **Check:** the service must clear the host by the clearance; elsewhere only contacts new or worse count. Option
+  clearance = the opening's gap. Review: structure for slabs and load-bearing walls, else architecture; a fire rating
+  adds fire-stopping. Tier 2 (after plain fixes and resize). Under "move only" requirements it is allowed (it asks).
+- **Muse is told** the opening a penetration would ask for, who cuts and reviews it, and that a service running out of
+  both faces must keep crossing; walls and slabs are no longer described as runs to split.
+- **Everywhere:** `TRIES`/`IN_TRIAL`/`EXTRA_FILES`/`KEEP`, `plans.KEEPS_CONTACTS`, chat and MCP `check_penetration`,
+  `Workspace.check_penetration` / `apply_penetration`; STEP export cuts the host (`BRepAlgoAPI_Cut`) and adds the
+  provision for void to the service's group. The viewer draws the host see-through in the preview and frames the
+  provision for void.
+- **Checked:** `tests/test_penetration.py` (15, incl. IFC2X3 and the endpoint/plan/patch); answer key still 3/3 first
+  try at Rev04 heights; `evals/step_cell.py` C7: Muse offers the opening (36 s), kept and cut, the STEP's wall 2,655
+  cm³ smaller with the provision for void in Compressed air; in the browser accepted in place, no file download.
+
+Which hosts take an opening (Oct 29, owner decision; `docs/edits.md` "Which hosts", code `server/sightline/hosts.py`,
+`domain_packs/penetrations.md`): beyond walls and slabs, Muse judges which kinds of element can take a hole.
+- **Order:** hard rules (`hosts.hard_rule`: columns, doors, windows, curtain walls, piles, footings, stairs, railings,
+  lifts, services and equipment, glazing by name or material, see-through proxies, and a **transfer element**: a beam
+  or member a column or wall stands on; Northbank's girder, which column B3 stands on) > the requirements'
+  `penetrations` rules per group (allowed / review / never, largest size, reviewer; omitted from the file when empty, so
+  its id is unchanged) > Muse's reading of each kind of host > the default (walls and slabs only).
+- **Muse's reading** (`hosts.read`, triage model, strict JSON, cached by kind for the server's life, read before a
+  proposal's first round): verdict, reviewer, fit (annular or fitted gland), limits (hole share of depth, distance from
+  ends and edges, middle third), conditions. Standard `Pset_*Common` facts only: a project's own psets (Northbank's
+  answer-key pset) never reach it. `Workspace.hosts_model` (none when a test injects the proposal model).
+- **The hole** (`hosts.check_hole`) against the limits; numbers on the option card (`hostRows` in fixKinds.ts).
+  Fitted openings: service + 1 mm, may touch. Openings in anything but a wall or slab rank after (`agent.tier`).
+- **Page:** Requirements dialog "Openings for services"; an opening read by Muse has **Add to requirements**, a rule
+  for that kind of host in its group only (`kind` = `hosts.profile` key, `edit.host_kind`), never the whole group. App imports `ClipboardPlus`, `addPenetration`, `hasPenetration`, `hostRows` (stubs updated).
+- **Cell C8** (demo-models): the 400 V feed's 32 mm conduit through EP-301's 3 mm gland plate. Rev A 161 parts, Rev B
+  185, 17 planted pairs. `step_classes.md` now names conduits (CONDUITSEGMENT); `samples/step-cache` regenerated.
+- **Checked:** `tests/test_hosts.py` (12); `evals/penetration_hosts.py` 25/25 on Muse Spark (18 kinds in one call,
+  34-41 s); `evals/step_cell.py` C7 and C8 (Ø34 mm fitted gland hole, kept, exported plate cut); answer key 3/3 first try
+  at Rev04 heights; 449 server tests, 59 web tests; C8 in the browser accepted in place.
+- **Review fixes (Oct 29):** host model resolved per request (60 s timeout), Muse's limits sanitised, narrow gland
+  plates still read, keeping an opening re-checks the hole, fitted options claim no clearance.
+
+Resize (Oct 29, owner decision; `docs/edits.md` "Resize", code `edits.resize_size` / `apply_resize`,
+`agent._try_resize`): the sixth kind of fix, a flatter section where an obstacle leaves too little depth.
+- **Shape:** `{"kind": "resize", "split_m": [a, b], "depth_m", "keep": "bottom" | "top" | "centre"}`; ORCA picks the
+  width: a duct keeps its equivalent diameter (Huebscher, to 5 mm, at most 4:1), a tray its cross-section (at least
+  50 mm deep). Pipes, round ducts, any profile but a plain `IfcRectangleProfileDef` (hollow, rounded, channel), STEP
+  parts, sloped runs and non-finite values refused with the reason.
+- **Geometry:** original, transition (`IfcDuctFitting` TRANSITION / `IfcCableCarrierFitting` REDUCER, lofted mesh, faces
+  at most 30°), resized middle (its own profile, keep face level), transition, rest; through `_build_chain`, which now
+  takes straights with their own profile and transition pieces. The middle and transitions carry the new size (name,
+  profile name, copied properties, `ORCA_Resize` pset); a centre-kept resize is sized by half its change (`face_move`).
+- **Review** services, performance line in `also_needs`; tier 1. Muse is told the depth that fits over or under the
+  obstacle and the width it makes (`_resize_text`). Everywhere: `TRIES`/`PARAMS`/`IN_TRIAL`/`KEEP`, `Workspace.check_resize`
+  / `apply_resize`, chat and MCP `check_resize`.
+- **Checked:** `tests/test_resize.py` (11, `fixtures.build_resize_fixture`); answer key 3/3 first try at Rev04 heights;
+  460 server tests; in the browser on the uploaded fixture Muse's only verified fix was "Flatten duct to 225 mm deep
+  under the beam" (710 x 225 mm), accepted in place. No planted demo case.
+
+Bigger uploads (Oct 29, owner decision: target 500 MB; design and measurements in `docs/uploads.md`, `evals/README.md`
+"Big models"):
+- **Way in:** the page checks the server's cap first (`GET /api/models`: `model_upload_max_mb`; `web/src/uploads.ts`),
+  gzips each file over 1 MB (`CompressionStream`, IFC packs about 5x), sends it with XHR (upload progress) to
+  `POST /api/models/upload/stream` (NDJSON: received, STEP events, opening, `boxes` done/total, a `tick` every 5 s, done
+  or error). The server refuses before reading (411 without Content-Length, 413 over the cap), unpacks `.gz` parts in
+  a thread, 1 MiB per gunzip step, capping the unpacked size as it goes and refusing a truncated archive
+  (`app._receive_models` / `_unpack`); a 409 `requirements_unknown` re-registers and resends once (`reRegister`). An
+  uploaded IFC is drawn from the visitor's own file, not downloaded back.
+- **Boxes** (`IfcScene.bounds`): meshes through CGAL (`hybrid-cgal-simple-opencascade`, 1 ms vs 20-30 ms), every
+  element through it from 50 MB (`SIGHTLINE_BIG_MODEL_MB`), in batches of 2,000 (one iterator held a 150 MB model's
+  shapes: 4.8 GB → 1.4 GB), threads from `sched_getaffinity`, progress callback. Northbank's boxes, order and 464
+  detected clashes are identical (checked).
+- **Detection's sweep** had no lower bound (quadratic): 500 MB 482 → 18 s; Northbank identical.
+- **Holding:** `SIGHTLINE_SCENE_BUDGET_MB` (IFC bytes, Modal 300) besides the count, room made before a new scene is
+  read (`Workspace._evict`); mesh-only bodies go through CGAL by one rule (`scene.meshes_only`); wider fixes refused above
+  `SIGHTLINE_WIDER_FIX_MAX_MB` (100: they copy the models); exports older than an hour deleted.
+- **Measured** (local, 4 CPUs): 150 MB through the page 123 s, 250 MB 194 s, 500 MB 484 s (2.8 GB server peak, 1.4 GB
+  JS heap). Cap stays **150 MB** on the demo by the plan's rule (about two minutes); 500 MB is blocked by box time and
+  web-ifc drawing on the main thread (next: a Web Worker). `evals/big_models.py`, `big_models_browser.cjs`.
+- **Checked:** `tests/test_uploads.py` (7), `web/tests/uploads.test.mjs` (3); 467 server tests, 62 web tests; golden
+  path unchanged. App imports `./uploads` (both harnesses compile it).
+- **After the reviews of PRs 26-32 (Oct 29):** 491 server tests, 63 web tests; answer key 3/3 first try at Rev04 heights
+  (Muse's girder opening refused as a transfer element); `evals/step_cell.py` passes (C1, C2, C6, C7, C8, Rev B 0);
+  golden path accepted in place, no file download.
+
+Escalating to Muse Wonder (Oct 29, owner decision; `docs/escalation.md`, code `server/sightline/escalation.py`,
+`spend.py`, `agent._try_combined`): a second, longer try on a larger model, for a clash Muse Spark could not fix or to
+look for a better fix.
+- **Model and money:** `meta_client.escalation_model()` (`META_ESCALATION_MODEL`, default `muse-wonder-1.0`, $4 / $20
+  per M tokens, no contributor tier). `MetaChatModel.usage` counts tokens (both endpoints, every final event);
+  `PRICES` by id prefix. One day's budget for every Wonder call, `SIGHTLINE_WONDER_MAX_USD_DAY` ($25): a request
+  claims its estimate when let through (`spend.claim`, checked and held in one step) and its work takes the claim
+  over (`spend.held`). Caps `SIGHTLINE_ESCALATE_PER_HOUR` / `_PER_DAY` plus one proposal, both or neither
+  (`ProposeLimit.take_all`). Setting `escalation` off / button / auto (+ `escalation_effort`), owner menu.
+- **The brief:** the first try (ideas, why each failed, what it hit by name, fixes found), openings and room past
+  the elements it ran into most, every element within 5 m, the kinds from the registry. The last try per scene and
+  pair is kept (`Workspace.last_try`, plan items too) and read only while its scene revision and requirements id
+  still match: a kept edit or a rule change makes its verified options stale.
+- **Combined fixes:** a seventh kind, 1-3 steps (move / offset / route) on different elements, one on A or B, never
+  structure (`agent.stays`, by inheritance) and nothing but services besides A and B; tried in one trial, checked
+  together, kept all or nothing (`edits.kept_files`), each split run's pieces as its own group (`groups` on
+  `/fix/apply`); ranks after one element's fix.
+- **Page:** NoFix **Ask Muse Wonder**, **Look for a better fix with Muse Wonder** under verified options, the same on a
+  failed Fix-together item; model chips; the pilot names the model; a failed second try puts the first's options
+  back. Chat and MCP: `propose_fixes(escalate=true)`.
+- **E0** (`evals/escalation.py`): on the 6 of 21 real clashes Spark left unfixed, Spark again 0/6, Spark + brief 3/6,
+  Wonder + brief 5/6 ($2.01 in all, ~2 min each). Four of Wonder's are C4 posts lifted off their slab, because a moved
+  element's existing embedment counted as a clash (the C5 HMI's floor contact): the move check now keeps what an
+  element stands on and refuses a lift off it (Oct 30, below).
+  B1 moves a pad footing (structure; no review chip yet). Answer key 3/3 first try at Rev04 heights.
+- **Checked:** 520 server tests, 64 web tests; in the browser Northbank #1 got Spark's offset and, on Look for a better
+  fix, Wonder's "Shorter offset up 400 mm through girder opening", both verified and chipped.
+
+Show it built (Oct 29, owner decision; `docs/show-it-built.md`, code `server/sightline/built.py`, `web/src/BuiltView.tsx`,
+`Viewer.captureBuilt`): Muse Image restyles ORCA's own view of a verified fix as a clean presentation render, checked
+against the model before anyone sees it.
+- **Capture:** `Viewer.captureBuilt(fix, pair, classOf)` in one task: a cutaway of 12 directions chosen by class costs
+  (`GET /api/scenes/{sid}/classes`; slabs/roofs/coverings become the section, zones never drawn), then look, ids and
+  normals from one camera. The ids pass swaps the batches' materials (an override material would draw pieces white).
+- **Check:** outline from ids + normals; two restyles at once (Responses, reasoning high); pixel gate (coarse edges
+  F ≥ 0.55, worst tile ≤ 0.45); two Muse Wonder judges per picture with the ids picture to read the model view by,
+  either unfaithful fails it; one more pair told the differences; else "Muse Image couldn't keep to the model here".
+  Cached by a hash of the passes and the prompt version (`SIGHTLINE_BUILT_CACHE`, `/api/built/<key>.jpg`).
+- **Money and who:** `built_views` (owner menu, For me / For everyone; `SIGHTLINE_BUILT_VIEWS`, default off). $0.62
+  held per request against the day's Wonder budget; over it, three Muse Spark judges (the lighter check, named in the
+  tooltip) while the pictures still fit. Caps `SIGHTLINE_BUILT_PER_HOUR` / `_PER_DAY`. Never a trim or a cleanup.
+- **Page:** **Show it built** on the chosen option and per verified fix in the Plan panel: the stage in words, then
+  the picture over ORCA's view with a wipe, **Lines from the model**, the check in a tooltip, the label "Illustration
+  by Muse Image from ORCA's model view. The model is the record." and what the cutaway took away. Accept (single,
+  plan, replayed) captures the fix as proposed and draws it in the background; the clash panel shows "As it could
+  look built". The report dialog waits for those and draws missing ones (at most 10); the PDF's fix page gets the
+  third picture or "No built view: …"; the BCF keeps the true capture. Chat `show_it_built`; MCP later.
+- **Once, keyed on the fix:** page keys are pair + kind + numbers + edit (titles repeat); a picture being drawn is
+  shared (page and server: `built.make` once per key); cache files written whole; a lighter-checked picture is drawn
+  again and checked by Wonder when it can be; judges keep their own effort (`meta_client.FIXED_EFFORT`); passes refused from their
+  header when oversized.
+- **Checked:** `tests/test_built.py` (11), `test_document.py`; in the browser Northbank #1's offset drew in ~70 s
+  (outline 0.94, both judges faithful), the cell's C6 route in ~80 s (0.88), wipe and lines work, Accept carried the
+  picture to the kept fix, and accept → triage → Report put it on the PDF's fix page as the fourth picture.
+- **Web tests:** App imports `./BuiltView` (`BuiltView`, `builtStep`, `cutText`) and the icon `Building2`: both stub
+  lists updated. The harness's transform cannot read `for (const [a, b] of …)` in App: use keys instead.
+- **After the final review (Oct 30):** pictures frame a combined fix by run and colour each piece by its run
+  (`agent._tagged`: `origin`, `part`), leave a penetration's provision for void undrawn (the opening stays open) and
+  anything not physical out; a kept fix whose pieces the page can't find is framed by the elements it changed. The
+  `escalating` event carries the first try's options (chat keeps them if the second try fails); a plan whose model
+  changed since it was checked can't be accepted (`planStale`); the stdio MCP hook respects the off switch; the owner's
+  page asks `/api/models` again after a change for everyone; a report draws at most 10 pictures and says so for the
+  rest. Known, not fixed: a combined step that moves another team's service doesn't add that team as a reviewer in the
+  PDF and BCF; a second try's options aren't de-duplicated against the first's.
+
+A move keeps what it stands on (Oct 30, owner request; `docs/edits.md`, code `verify.supports` / `keep_supports`):
+- **Why:** the cell's fence posts move as a run with their M10 anchors cast 70 mm into the slab, so every horizontal move
+  hit the slab; Muse Wonder lifted posts 100-200 mm off it to pass (E0). The C5 HMI's floor contact failed the same way.
+- **Rule:** for moved elements that are not runs (`IfcFlowSegment` / `IfcFlowFitting`) nor see-through zones
+  (`scene.opacity`), what they stand on or sit in (base at a host's top or ≤ 300 mm into it, `verify.stands_on`) is kept
+  when no deeper than before (a touch stays a touch); lifted off everything it stood on fails ("standing on nothing"),
+  sunk deeper fails, anything new it cuts into is a clash. Never the clash's partner. Clearance is to what is near it.
+- **Where:** `agent._try_move` (partners = B and a plan item's others), `plans.verify_together`, and
+  `Workspace.verify_move(obstacles=)` (the page's manual move sends B; chat / MCP `check_move(obstacle=)`); without an
+  obstacle every contact counts. Combined move steps keep the old rule. Runs are untouched, so the answer key and every
+  service move check as before.
+- **Checked:** `tests/test_supports.py` (8); `evals/step_cell.py` passes (C1, C2, C3, C6, C7, C8, Rev B 0); Muse Spark
+  single proposals now fix C4 first try with plain moves (post N3/N4 350 mm north, 21-25 s, no lifts), where before
+  every horizontal move failed; C5 still has no fix (every direction hits a conveyor, tray or filter: real); 540 server
+  tests, 64 web tests.
+
+`.env` before every setting (Oct 30, owner request; code `server/sightline/__init__.py`, `limits.env_int` /
+`env_float`; docs [15](15-requirements-settings-and-config.md), [10](10-http-api-and-streams.md)):
+- **Why:** `app.py` imported its modules before it called `load_env()`, so the settings they read at import
+  (`SIGHTLINE_MAX_SCENES`, `SIGHTLINE_SCENE_BUDGET_MB`, `SIGHTLINE_MAX_REPORTS`, `SIGHTLINE_SAMPLE_EXCLUDE`,
+  `SIGHTLINE_STEP_MAX_PARTS` / `_MAX_TRIANGLES`, `SIGHTLINE_BIG_MODEL_MB`, `SIGHTLINE_WIDER_FIX_MAX_MB`,
+  `SIGHTLINE_BUILT_CACHE`) ignored a value set only in `.env` on local runs. Modal sets real variables, so the deploy
+  was unaffected. An empty cap (`SIGHTLINE_PROPOSE_PER_HOUR=`) reached `int("")` and stopped the server at import,
+  although `.env.example` said "off when empty or 0"; it also implied every cap is off when unset, but requirements
+  files (120 an hour) and previews (60) have defaults of their own.
+- **Now:** the package's `__init__.py` calls `meta_client.load_env()`, so `.env` is read on the first import of any
+  module (web server, stdio MCP, tests, evals) and before any setting; real environment variables still win. Every
+  number setting is read with `limits.env_int` / `env_float`: unset or empty is the default, anything else that is not
+  a number still raises. An empty `SIGHTLINE_BUILT_CACHE` is its default (it would have been the working directory).
+  `.env.example` says what unset, empty and 0 mean and lists the two caps that default on.
+- **Checked:** `tests/test_env_file.py` (3; a fresh interpreter on a copy of the package beside its own `.env`): before
+  the change `.env`'s `SIGHTLINE_MAX_SCENES=7` read as 0 and an empty cap stopped the import with `ValueError`. 553
+  server tests. Locally, uvicorn started with a `.env` holding empty caps (`/api/models` answered, with the model
+  upload size set there); importing the app with the same file gave `SIGHTLINE_MAX_SCENES=1` as the Workspace's
+  limit, no proposal limit and requirements files at 120 an hour.
+
+Chat and MCP take their routes' caps; a visitor is the peer (Oct 30, owner request; code `plans.read_patterns`,
+`chat.Chat._run`, `mcp_server` `caps` / `Hooks.detect`, `limits.client_id`; docs 09 and 16):
+- **Pattern readings:** chat and MCP `find_patterns` made a fresh Muse Spark call every time, uncharged; the route
+  charged one proposal and cached per report. Now all three go through `plans.read_patterns`: one proposal for a
+  reading not made yet, kept on the Workspace (64), a caller who comes while it is being made waits for it, and
+  no patterns cost nothing (the route used to charge one for an empty reading).
+- **Detection:** chat and MCP `detect_clashes`, and MCP `open_models` checking on the server, now take one detection
+  run (`SIGHTLINE_DETECT_PER_HOUR` / `_PER_DAY`) like `/detect/stream`, charged to the visitor or the link's creator,
+  never the owner. Off on Modal, as before.
+- **Who a visitor is:** measured with a throwaway Modal app, from outside and from inside Modal: the edge strips any
+  client `X-Forwarded-For` (one value, a list, junk, two header lines), sets none, and gives the app the caller's own
+  address as the peer, HTTP and WebSocket. `X-Real-IP` and `Forwarded` pass through as the client wrote them. So
+  the old "first entry" rule was harmless on Modal (no header ever arrived) but would let a visitor pick their own
+  identity behind a proxy that appends. The deploy now sets `SIGHTLINE_TRUST_FORWARDED` 0; any N > 0 takes the N-th
+  entry from the right. The live app needs nothing now; its next deploy picks up the setting.
+- **Checked:** 559 server tests (9 new: `test_limits.py` 3, `test_chat.py` 3, `test_mcp.py` 2, `test_plans.py` 1;
+  the 5 chat and MCP ones fail on the old code, as do the spoofing ones); locally with Muse Spark, a chat asked to check
+  the models after the visitor's one detection run got "refused: detection runs used" and said so.
+
+ORCA in every download, and the cell tour on the current cell (Oct 30, owner request; `docs/architecture/14`, `19`, `21`):
+- **Downloads:** the report is `orca-report.pdf` (`orca-report-<team or model>.pdf`, zipped as `orca-report.zip`) with
+  `orca-issues.bcfzip`; a multi-file export is `<project>-orca.zip` (`app.export_zip_name`; `service.project_name`, the
+  page's `projectName` rule: "Northbank-orca.zip", one STEP model "PC-03-Palletising-Cell-RevA-orca.zip", else
+  `orca-export.zip`). Temp folders keep `sightline-*`.
+- **The PDF names the triage model that ran** (`document.triage_by`): the triage run's `info`, else
+  `meta_client.triage_model_info()` (a restart); was always "Muse Spark Open".
+- **Cell tour:** 161 parts, eight problems / 17 pairs, "17 of 17"; Accept steps (both tours) say the viewer swaps in the
+  changed parts without reloading. The Oct 28 recordings named parts of the 144-part STEP (STEP GlobalIds follow its
+  bytes), so they could not be drawn or accepted; re-recorded live on the current STEP (ladder: 120 mm offset first,
+  100 mm whole-ladder raise second; pipe plan: a 900 mm route west). Muse ranks a comfortable offset over the
+  designers' 150 mm raise, so the ladder copy names the option on screen (`TourState.optionKinds`); act "A move" is
+  now "One fix".
+- **Recorded-run offer:** a failed or empty live proposal also ends "done", so the offer never showed on an error;
+  now it does (`liveMissed`), and a plan that fails to start moves the tour on to the step that offers its recording.
+- **Checked:** 552 server tests, 69 web tests (`tour.test.mjs` new); `evals/detection_cell.py` Rev A 17/17, 0
+  unexpected (`evals/runs/2026-10-30-cell-detection/`); in headless Chromium the cell tour live (recording) and again
+  with the live streams refused: both recordings offered, replayed and accepted in place (one model download, at open),
+  all 12 steps; the live export and report downloads carry the new names.
+
+Keeping a fix tries it again (Oct 30, owner request; [07](07-fixes-and-edits.md) "Keeping a fix", code `plans.recheck` /
+`plans.apply`, `edits.kept_files`):
+- **Why:** `POST .../fix/apply`, `.../plan/apply` and the older `/apply`, `/offset/apply`, `/trim/apply` rebuilt a fix from
+  the page's kind and parameters without checking it again, so any client could keep an edit that was never verified
+  (an arbitrary move, an offset with any split or height), and a plan refused part way kept the fixes before it.
+- **Now:** every keep goes through `plans.apply`: each option is tried again as its proposal tried it (`plans.CANDIDATE`
+  back to Muse's parameters, `agent.TRIES` with the clearance, policies and recommend-only `Workspace.fix_settings` sets
+  for the clash it names), several are checked together (`verify_together`), then all are kept in one
+  `edits.kept_files` (now re-entrant, and restoring the edited marks, revision and history on failure) or none. What
+  the trial made is kept: a move's whole run, the trim's end at the joint. A fix that no longer passes is a 409
+  (`plans.NotVerified`) with why. Options carry `pair` and `others` (`agent.resolve`); the page sends every kind to
+  `/fix/apply` with the clash pair, plans send each item's; the old routes need their partner (`obstacles` / `other`).
+- **Checked:** `tests/test_keep_verified.py` (9); existing tests now keep honest fixes (one export test was keeping an
+  offset the second model's beam blocked); `web/tests/accept.test.mjs`. On Northbank in the browser, Muse Spark's
+  "Offset duct up 400 mm through girder opening" on #1 was re-checked at keep (50 mm, 21 elements) and patched in
+  place; tampered options on the same scene (tray up 100 mm, the cold water main not moved, the kept offset sent again,
+  no pair) were refused in 0.4-1.0 s with the scene unchanged. The girder root-cause plan (duct +400, tray +250, cold
+  water +280 mm and three trims) was kept through `plans.apply` in 7.4 s; the same plan sent again was refused. 559
+  server tests, 65 web tests.
+
+Joints (Oct 30, owner decision after a fix moved the cell's PL-302 segment 3 off column C3 and left it apart from its
+bend; design in `docs/connections.md`, code `server/sightline/connections.py`): slice 1 of 3 (joints → moves that
+carry and stretch → hover highlight).
+- **Joints:** connected ports (read live), and for STEP parts (no ports) flow parts of one group meeting face to face:
+  a straight segment offers its two caps, anything else its large planar faces; within 2 mm, normals opposed, the face
+  centre inside the other's triangle. Ends: "start"/"end" cap or "side" (a branch). Classes: straight / rigid
+  (fittings, in-line valves, dampers, meters) / stays (equipment, terminals, filters, structure, non-flow).
+- **Runs:** `connections.run` = straight segments joined cap to cap, the element first; a non-flow part keeps
+  `connected_run` without flow parts. `scene.connected_run` is unchanged (the wider-fix planner uses it).
+- **A move that would pull a joint apart is refused** (`plan_move`, `SIGHTLINE_CONNECTED_MOVES` refuse | carry | off):
+  `_try_move` ("cannot keep its joints: …", the joints as hits), combined steps, plans (`joint` hits),
+  `Workspace.verify_move` (`reason`) / `apply` (`/apply` 422), chat and MCP `check_move`, the page's manual move ("Not
+  tried: …"). Muse reads what each side is joined to (`connections.describe`); `construction.md` says joints stay joined.
+- **Measured:** every Northbank MEP segment is joined at an end; answer key 3/3 first try at Rev04 heights (Muse stopped
+  proposing whole moves of joined runs); cell #22 gets only routes; the cell's 40 flow parts' joints in 3.8 s.
+- **Tests:** `tests/test_connections.py` (`fixtures.build_joints_fixture`: a PL-302 with ports, a tee, a valve, a
+  filter; a STEP air line written with OCP and classified by a stand-in); `test_accept_in_place` moves whole runs.
+
+Moves that keep their joints (Oct 30, slice 2 of connections; `docs/connections.md`): `SIGHTLINE_CONNECTED_MOVES` is
+`carry` by default.
+- **The walk** (`connections.plan_move`): fittings and in-line valves beyond a run go along; a straight segment the move
+  runs along (< 0.5 mm across) gets longer or shorter at that end; a rectangular segment covered end-on at its side (a
+  ladder riser under its bend) grows that way; any other segment goes along; equipment, terminals, filters,
+  structure, KeepFixed, a branch off a segment's side, a piece < 50 mm or > 12 parts along: refused, named.
+- **`edits.stretch`** (cap: extrusion depth and start; side: new rectangle profile and position; ports at that face
+  shifted without turning; shared bodies refused). `apply_move`, `check_joints` (ports ≤ 2 mm, STEP faces still meet),
+  `trial_move` / `check_applied` (moved parts ignore what they're joined to; stretched segments count only contacts new
+  or worse than `baseline`).
+- **Still kind "move":** `edit` {summary, key, run, carried, stretched, joints}, `preview` = stretched meshes;
+  `Workspace.apply(expect=edit)` plans again and refuses a changed key; the page accepts a move with `edit` through
+  `/fix/apply`, draws stretched pieces (`Viewer.showOptions`, `captureBuilt`), the manual move previews them. Combined
+  steps carry and refuse overlapping steps; `verify_together` reports two items changing one element as a conflict;
+  Muse reads per direction what keeps the joints (`describe`).
+- **Measured:** cell C2 lifts 4 parts and the riser 150 mm taller on its plate (STEP export too); C6 as a move keeps
+  its joints but hits ES-2; #61 in the browser: "move up 100 mm; takes … along; riser 100 mm longer", accepted in place;
+  Northbank census `evals/joints.py` (195 of 1,992 dry plans keep their joints, median 16 ms); answer key 3/3. Cell
+  tour: ladder copy updated, `web/public/tour/cell-ladder.json` recorded again (its move option carries).
+- **Tests:** `tests/test_connected_moves.py` (walk, refusals, tolerance, promotion, tee, stretch, agent, keep with a
+  stale key, plans, STEP ladder export), `test_accept_in_place` (a lone move takes its joined end segment along).
+
+See connections (Oct 30, slice 3 of connections; `docs/connections.md`, code `connections.graph`, `web/src/links.ts`,
+`Viewer.setLinks`):
+- **Graph:** `GET /api/scenes/{sid}/connections`: edges `[a, b, kind, source]` (joint, assembly, hosted, rests_on,
+  contact), plus stops, systems, assemblies and names; cached by revision and contacts. Detection now keeps the pairs that only touch
+  (run state `contacts`). `Workspace.describe` (card, chat and MCP `describe_element`) gives `links` by kind with
+  names, `systems` and `part_of`. Northbank 0.38 s (875 rests on, 650 joints, 26 hosted, 6 contacts).
+- **Page:**
+  - Alt (Option) + point, or the **Connections** toggle (rail, key L; the phone's Tools sheet), lights what an element
+    is linked to, by kind: joined `#2563eb`, rests on / supports green, hosted brown, assembly slate, touches light
+    blue. A label names it with counts, and Shift lights the whole run (to equipment) and its assembly.
+  - A click or tap with the toggle on does the same and the card lists the links (a name selects and frames it).
+  - A carrying move's option shows what it takes along in blue.
+  - The layer is hidden in A/B/C pictures, thumbnails and built views.
+- **Phone popovers** now render into the body: inside the rail they sat under the bottom sheet.
+- **Web tests:** App imports `./links` (both harnesses compile it); `tests/links.test.mjs`, `tests/viewer-links.test.mjs`.
+
+Sign-offs kept per report (Oct 30; code `web/src/signoffs.ts`, `Report.requirements_id`):
+- **Why:** review sign-offs were kept in `localStorage` under the report's title, and every detection run is titled
+  "Coordination · N models", so one project's or run's reviews showed on another with the same model count. The PDF
+  stays DRAFT until each page has a review from every team involved, so those reviews could lift it wrongly.
+- **Key:** a detection run's per clash, under its id (`sightline.signoffs:clash:<id>`). The id hashes the test and the
+  GlobalId pair, so a rerun, a requirements change (Add to requirements makes a new requirements id) or opening fewer
+  of the same models keeps a clash's reviews, and another project's clashes never share them. An imported report's
+  under its title and sorted files (`sightline.signoffs:import:<title>:<files>`), since a Navisworks id is a place in
+  its file; opening the same report again (a new report id each time) finds them. The server names a run's
+  requirements on the report (`requirements_id` in the summary), for the record.
+- **Old entries:** a title-keyed one moves over when a report with that title opens, for the clashes that report has
+  (a detection run's ids name their elements, so another project's never match), never over a newer review; the rest
+  wait for their own report, and the old key goes when it is empty (`migrateTitleKeyed`).
+- **Review fixes before merging:** the first version keyed a run by its requirements and files and deleted every
+  title-keyed entry on load, so a rule change or a deploy lost sign-offs, and an imported report lost them on reopening.
+- **Checked:** `tests/test_detect.py` (a run names its requirements), `web/tests/signoffs.test.mjs` (5: keys, a rerun
+  under new rules and with fewer models, junk and no storage, the migration with an imported report and two projects of
+  one title, the page); 80 web tests.
+
+About ORCA (Oct 30, owner request; code `web/src/AboutOrca.tsx`, `web/src/aboutRoute.ts`, CSS "About ORCA" in
+`index.css`):
+- **What:** a full page over the app, in six tabs (Overview, How it works, The fixes, The AI, Under the hood, Proof and
+  limits), presenting the architecture map's story for visitors and judges. It replaces the header's "How it works"
+  dialog (the old `About` in dialog mode); the landing keeps `About` and gains a "Go deeper" card. Header, phone menu
+  and landing open it; `#about` / `#about/<tab>` is its address (pushed on open, so Back closes it).
+- **Animations:** the ORCA loop (a dot round Observe, Resolve, Check, Apply), Northbank #1 before and after (the duct
+  raised through the web opening), a before/after picture per fix kind, an auto-advancing six-stage pipeline, the
+  propose-check-retry loop, flowing architecture links, count-up numbers, sections fading up as they scroll in. All
+  CSS/SVG, no new dependency; `prefers-reduced-motion` shows the "after" states, still.
+- **Numbers:** only the measured ones the landing and README already use (464 in about 4 s, ~40 s, 3 of 3, 17 of 17,
+  161 parts, 25 of 25 hosts, 150 MB in about two minutes). Change them with the landing's.
+- **Checked:** `npm run build`, `npm test` (`tests/about.test.mjs`, 5; App's stub lists take `AboutOrca` and compile
+  `aboutRoute`); in Chromium at 1440x900 and 390x844 (touch) every tab renders, no console errors, no sideways scroll,
+  Escape / Close / Back close it, the tab bar follows the chosen tab, and reduced motion shows the fix pictures' after
+  state.
+
+Navigate freely, and drawing views beside 3D (Oct 30; design [docs/views.md](../views.md); code `web/src/viewer/views.ts`,
+`cube.ts`, `drawing.ts`, `annotate.ts`, `Viewer.ts`, `web/src/ViewPanes.tsx`, `ViewerToolbar.tsx`, `App.tsx`,
+`server/sightline/datums.py`; branch `feature/drawing-views`):
+- **Why:** once a clash was picked there was no plain model to move around in, and one view only, where coordinators
+  read a clash in plan at its level and in section through it (owner, Oct 29–30).
+- **Navigation:** leaving a clash (Esc, one thing at a time, or ✕ on the clash chip; not while ORCA works on it); Fly to
+  clash (on: every click on a clash takes every unpinned view there); F frames the selection first; orbit about the
+  point under the pointer (`OrbitControls`' target slid along the view ray, about 8 ms a press); a view cube with 26
+  directions and Home; orthographic; back and forward; Home and saved views per project; a section box round the clash,
+  the selection or what is in view, with grips.
+- **Styles and visibility:** Shaded, Consistent colours, Shaded with edges, Hidden line and X-ray (G); with a clash in
+  Shaded the rest grey or in its own colours; the selection blue in every view; filters by model, class and level; hide
+  and isolate for now (element card, cyan frame and chip). Wireframe left out (three.js cannot draw a `BatchedMesh`
+  as wireframe).
+- **Drawing views:** Single, Two, Quad (Q); plans, a section, elevations as orthographic cameras with global clip planes;
+  paper fills, cut faces filled by stencil parity (grey hatch, red, green, purple, amber where A and B overlap), the
+  pair's hidden parts ghosted, linework and a heavy cut outline from normals and depth in one composite shader; grids,
+  levels, a revision cloud with `#N`, the other views' marks, title, scale and north. Every clash click sets each
+  unpinned view: plan at its storey with the cut through it, section along the run that moves with a far clip 2 m
+  beyond the pair, elevation facing the section's way. Headers set view range, presets, far clip and crop; handles
+  in other views drag a section's line, ends, far clip and sides, a plan's cut and bottom, a section's crop (Esc
+  reverts). A right click in a drawing turns the 3D view there.
+- **Server:** `GET /api/scenes/{sid}/datums` (`datums.py`): levels merged across files at world z, grid axes (a sample
+  scene with none reads `<prefix>-Grids.ifc` as context, never added to the scene), each element's storey.
+- **Captures unchanged:** every capture goes through `fullCanvas` with the user's style, filters, hides, selection and
+  projection lifted, and restores the drawings' version so thumbnails redraw nothing.
+- **Checked:** in Playwright on Northbank (software GL): A/B/C, thumbnails, `capture()` and Show it built's passes
+  byte-identical in Single and Quad and with a style, filters, a hide and orthographic on; redraws in Quad: idle 0,
+  orbiting 0 (the plan's 3D camera mark only), a new clash 3; a cut dragged in a section from +3.058 to +3.568 and a
+  section line moved in plan; phone shows Single only with no sideways scroll. `server/tests/test_datums.py` (6),
+  `web/tests/views.test.mjs` (11), `web/tests/drawing.test.mjs` (4); 95 web tests; `npm run build` and `tsc` clean.
+  Frame times on a real GPU are still to measure.
+
+Review of the drawing views (Oct 30; PR review on `feature/drawing-views`; code `web/src/viewer/Viewer.ts`, `drawing.ts`,
+`views.ts`, `cube.ts`, `web/src/ViewPanes.tsx`, `App.tsx`):
+- **Drawing:** everything but the pair is counted for cut faces (back faces up, front down) instead of parity, so a post
+  set in a wall or a car built of overlapping parts fills instead of leaving a paper hole (checked against the parity
+  render of Level 01: only those overlaps differ). The redraw key includes the look and up, so an elevation turned
+  from its header redraws. The section box cuts Shaded with edges and Hidden line.
+- **Panes:** new panes frame the clash or the model, never the IFC origin; the header's Section starts through the
+  model's middle; the drawings' own visibility is built on a layout change; annotation canvases are cleared only when
+  their size changes (maximise and back kept them blank); the splitter stays within 0.2–0.8 and lets go on a cancelled
+  drag, with no text selected; a maximised 3D pane keeps its way back to the layout.
+- **State:** the view cube's Home gets its click; plans open on Level 01 once the real levels arrive; two names for one
+  floor no longer make a 0 m storey (`views.nextAbove`); Go to the clash is off once the clash is gone; Back is off
+  right after opening models; Esc keeps the clash in a clash plan or a wider fix; classes and storeys are read again
+  after a kept fix, each request on its own; the menus re-render at most once a frame, with counts and the model's box
+  cached.
+- **Checked:** 102 web tests (a same-height level, an elevation's key), build and `tsc` clean; in Chromium on
+  Northbank: Isolate then Quad shows the whole model in the plan, North elevation redraws, annotations survive
+  maximise and back, the splitter stops at 0.8 and stays put after, Home picks nothing, Go to the clash off after
+  leaving, Back off after opening, the plan opens on Level 01.
+- **Narrow panes (owner feedback, same day):** a drawing's header overflowed its pane at smaller widths (the picker
+  squeezed to nothing, maximise outside the header). It now folds (range words, then pin / go / fit into the range
+  menu) and the picker shrinks last; the title block and scale bar stack when they would meet. Checked in Chromium in
+  Quad at 1600, 1366 and 1180 px: no control outside its header in any pane.
+
+Drawing views after the live smoke test (Oct 30; owner's smoke test of the deploy; code `web/src/viewer/drawing.ts`,
+`Viewer.ts`, `annotate.ts`, `web/src/ui.tsx`, `App.tsx`):
+- **The viewer went blank** (a lost WebGL context, the owner's screenshot: every WebGL picture gone, the 2D layers
+  left): each drawing pane's targets were 4× multisampled, about 90 MB a pane at 2× pixels on a large screen. Drawings
+  now have no multisampling (they differ from before by a pixel at some edges), a pane hidden by a maximised one gives
+  its targets back, and the edge styles' targets go when the style does. A lost context is announced on the stage and
+  every pane is drawn again when it comes back (a reload offered after 5 s); captures return nothing meanwhile and the
+  thumbnail queue waits, so no black pictures reach the list or the server.
+- **Panning a drawing stuttered:** every pointer move redrew it. A pan or zoom now moves the last picture and draws once
+  it rests; a view that cuts starts its camera at the cut (nothing above a plan's cut, nothing behind a section line is
+  drawn) and the passes that clip at a bottom or far clip stop there; a pane composites only when its picture changes.
+- **Blinking:** a resize cleared the canvas after the frame's drawing; the canvas is now resized only when its size
+  changes, and drawn again at once.
+- **The plan's 3D camera mark changed size** as the orbit point moved to what was under the pointer: it is now a fixed
+  size.
+- **The page scrolled** with a rail menu open (the Visibility list, the Camera and Views menus on shorter windows):
+  menus now stay inside the window, moving up and scrolling inside when taller.
+- **Checked** in Chromium on Northbank (software GL): panning a plan, 60 moves, no redraws while it goes on and one at
+  rest; ten wheel steps, one redraw after; orbiting the 3D, no drawing redraws or composites; a context lost and
+  restored with `WEBGL_lose_context`: the notice, then every pane back with the same content, no black thumbnails;
+  A/B/C, thumbnails, `capture()` and Show it built's passes still byte-identical in Single and Quad; the rail menus at
+  1600×1000, 1440×800 and 1366×700 leave the page its height; drawings at rest match the merged build in the section,
+  elevation and 3D panes (no multisampling aside) and in the plan apart from the camera mark; 102 web tests.
+- **Esc closed a menu and left the clash** (found in the live check after the deploy): with a rail or pane menu open,
+  Esc now closes only the menu (`Popover` stops the key there, before `App`'s window listener).
+
+Approved identity and motion library (Oct 30, owner request; `assets/brand/orca/`, design in
+`docs/brand-assets.md`):
+- **Identity:** owner selected direction 05 / ORCA Type: custom geometric wordmark and split-O symbol. Added the
+  shared vector master, outlined SVGs, transparent PNGs, icon/favicons, maskable variants, print PDF/EPS, social/video
+  graphics, palette tokens, approved concept reference and usage guide for the upcoming redesign.
+- **Motion:** Orbit, Breathe and Resolve loading loops, a demonstrative four-phase cycle, Settle and Reveal;
+  animated SVG, transparent APNG and GIF previews; dependency-free native elements and React TypeScript wrappers.
+  Production phases follow real events, one-shot effects settle, and web motion honours reduced-motion preferences.
+- **Repository handoff:** kept outside the served application; locked generator dependencies, one geometry source,
+  portable browser selection, ignored intermediate/archive directories, and reproducible build/check commands.
+- **Checked:** production web build; 102 web tests; 9 architecture-map tests; strict React wrapper type check;
+  actual gallery/native-element/standalone-SVG browser checks (motion, pause, size/speed/theme, accessible labels,
+  safe dynamic text, real phase control, one-shot final states, reduced motion, 320/390/768 px and desktop layouts);
+  static and motion export validation. The pack is ready for integration in a subsequent application redesign.
+
+Measure in every view, and the rail split (Oct 30; owner request; design [docs/measure.md](../measure.md); code
+`web/src/viewer/measure.ts`, `Viewer.ts`, `web/src/MeasurePanel.tsx`, `ViewerToolbar.tsx`, `App.tsx`):
+- **Measure everywhere:** M works in the 3D view and in every drawing. In a drawing both points lie on its plane (a
+  plan measures on its cut, a section in its plane), with a drawing's ticks at the ends; the 3D view shows every
+  measurement. A rubber band with its length runs to the pointer before the second click.
+- **Snapping** (on by default; the panel's toggle or N): ends, midpoints and edges of the element under the pointer
+  (its feature edges), and in a cut drawing the cut outline, joined into straight runs so a face split in two triangles
+  has one midpoint; the elements 10 px round it when that gives nothing. A glyph shows what it found.
+- **Several measurements** in the Measure panel (beside the rail; drag its header, fold it): copy one or all (length,
+  components, view and both ends in model coordinates), delete one, clear all. The old single 3D measure goes.
+- **The rail:** in Two and Quad the 3D view's own tools (modes, style, section box, outlines, connections, Home, camera,
+  saved views) move into the 3D pane, folded to its height; go to clash, measure, views, visibility and the screenshot
+  stay at the left. Fly to clash moves to the Views menu.
+- **Checked** in Chromium on Northbank (software GL), Quad: snaps on a grid of pointer positions (plan: 8 ends, 4
+  midpoints, 24 edges; 3D: 5 ends, 3 midpoints, 7 edges); measurements in the plan (on its cut, Δz 0), the 3D view and
+  the section; Copy all to the clipboard; delete, Clear all, N, Esc (first point, then the tool), drag and fold; the
+  rails in Single, Two, Quad and with the plan maximised, at 1600×1000 and 1366×768 (the 3D group inside its pane each
+  time); A/B/C, thumbnails, `capture()` and Show it built's passes still byte-identical; `web/tests/measure.test.mjs`
+  (6); 108 web tests.
+
+Panels that dock, collapse, float and pop out (Oct 30; `feature/dockable-panels`; design [docs/panels.md](../panels.md);
+code `web/src/dock.tsx`, `web/src/dockLayout.ts`, `web/src/App.tsx`, `web/src/ui.tsx`, `web/src/Tour.tsx`,
+`web/src/index.css`, `web/public/popout.html`):
+- **Owner decisions:** a real docking library (dockview 8.5.1, MIT, pinned with `overrides`; never its paid package),
+  before the freeze, the default layout the classic one, pop-out windows in the first version.
+- **How:** each panel's content is drawn into a slot that only moves, so nothing `App` draws remounts; the classic
+  layout (phones, tablets, the landing, the Classic switch) places the same slots as `display: contents`, so its CSS is
+  unchanged. Side bars keep their tabs on top while open and collapse to a strip; `setTab` shows the panel in the dock;
+  a dock tab runs the classic tab handler; the layout is saved per browser with pop-outs put back; the tour brings
+  panels home. Keys, tooltips and popovers work in a pop-out window.
+- **Found on the way:** a floating panel's opaque scroller culled the WebGL canvas under it (fixed: docked slots draw
+  no background); StrictMode disposed the dock's subscriptions (fixed: let go only on a real unmount); dockview's
+  `clear()` leaves side bars collapsed (Reset removes them). The blank viewer (a lost WebGL context) was fixed on
+  `main` meanwhile (the entry above) and merged in.
+- **Checked:** `web/tests/dock.test.mjs` (7); 109 web tests; `npm run build` and `tsc` clean; bundle +93 kB JS and
+  +11 kB CSS gzipped. In Playwright on Northbank (software GL): the default layout; float, collapse, reopen, tab
+  clicks; Chat popped out (styles, typing, a tooltip, M reaching the page), its window closed and popped out again;
+  reload with a popped-out, a floating and a collapsed panel; Reset; Classic; the tour gathering panels; #1 proposed
+  with the Clash panel floating, put back mid-run and accepted (1 fixed); tablet and phone unchanged.
+
+Review of the panels (Oct 30; PR review on `feature/dockable-panels`; code `web/src/dock.tsx`, `dockLayout.ts`,
+`App.tsx`, `index.css`, `ReportList.tsx`, `Chat.tsx`, `ui.tsx`):
+- **Saved layouts:** a floating or pop-out window split into several groups is written as a grid; reading only a group's
+  views threw the whole layout away on reload (`windowViews`). After `fromJSON` the model is locked against drops
+  again (dockview restores `no-drop-target` as `true`).
+- **The dock:** one `components` object (a new one each render re-laid the dock out several times a second while an
+  agent worked); the handle and pop-out windows let go on a real unmount, and only the handle this dock published;
+  `tab` follows whatever brings Clash, Plan or Chat to the front; the tour reopens closed panels; tab padding inside the
+  part that sees clicks (an edge click collapsed the bar); the scroll memory prunes removed scrollers; the badges and
+  side widths computed once (`clashBadge`, `planBadge`, `PANE`).
+- **Pop-outs:** the clash list scrolls its row in its own document; hands-free voice follows the chat's window.
+- **After merging main:** a menu in a dock panel was cut off at the panel's edge; `Popover` keeps it inside the
+  window narrowed by whatever clips it (`roomFor`).
+- **Checked:** 111 web tests (a split floating and pop-out window, shared widths); in Chromium on Northbank: an edge
+  click on the right bar's active tab leaves it at 380 px; after a reload the model's group saves `no-drop-target`;
+  Chat closed, the tour opens it again; the Visibility menu fits the Model panel at 1440×800.
+
+Properties of any element (Oct 30; `feature/element-properties`, on top of the panels; code `server/sightline/properties.py`,
+`service.py`, `app.py`, `web/src/Properties.tsx`, `App.tsx`, `dock.tsx`, `dockLayout.ts`):
+- **What:** a click selects any element, also through a see-through view (a click that meets nothing in focus takes the
+  faded element behind); on a desktop the Properties panel floats in where the old card was and can be docked or popped
+  out; it shows the card, then type, materials, size, attributes, every property set and quantity set (SI), with a
+  filter and click to copy. Classic layout, tablets and phones: the card with All properties.
+- **Server:** `GET /api/scenes/{sid}/elements/{gid}/properties`; the demo models' own set shows as "Model data",
+  without its scripting note.
+- **Also on the panels branch:** the docked page could scroll (dockview parks hidden panels' layers below the dock;
+  measured scrollHeight 1750 in a 900 px window, shifted 203 px): the app and dock area now clip.
+- **Checked:** `server/tests/test_properties.py` (5), `web/tests/properties.test.mjs` (4); 113 web tests, 115 after the
+  panels review merged in; build clean.
+  In Playwright on Northbank: #1 in focus (X-ray), a click on the faded furniture behind selects it; the girder reads
+  Steel S355, 400 × 12000 × 1000 mm, Model data without its scripting note; the filter; Esc empties the panel; the
+  classic card's All properties; the page never scrolls.
+
+The owner's test of the panels (Oct 30; `fix/dock-empty-bars-tooltips`; code `web/src/dock.tsx`, `dockLayout.ts`,
+`index.css`; [docs/panels.md](../panels.md)):
+- **Empty side bars give their room to the model** (`fitEdges`, dockview's `setEdgeGroupVisible`): a bar whose panels
+  all floated, popped out, closed or moved beside the model is hidden; it comes back at its width when a panel docks
+  there. A saved layout whose pop-out emptied a bar shows the bar again (`withoutPopouts`).
+- **On top:** the dock area is its own stacking layer, so tooltips (200) and dialogs (40) are above dockview's floating
+  panels (999 and up); a rail or view header with an open menu rises to 5000 while it is open.
+- **Pop out a bar's only panel:** dockview does nothing for it (it won't take an edge group out), so Open in New Window
+  never worked for Coordination or Activity. `popOut` floats it first and `returnToBars` puts it back in its bar when the
+  window closes. Floated panels step down and left so none covers another's tabs.
+- **Checked:** 121 web tests (`dock.test.mjs`: a bar emptied by a pop-out shows again on load); build clean. In
+  Chromium on Northbank at 1440×900: Coordination floated, model 750 → 1060 px; all five floated, model 1440 × 850, kept
+  after a reload; Clash put back, right bar at 380 px; Coordination, Activity and a lone Clash out and back through the
+  button and the menu; Reset; a floating panel's tooltip, a rail tooltip, the Visibility menu and a Quad view's menu
+  over floating panels, and the panel on top again once a menu closes.
+
+When the server lets go of the models (Oct 30; code `server/sightline/app.py`, `web/src/api.ts`, `App.tsx`,
+`BuiltView.tsx`, `index.css`):
+- **Found:** "No built view. Model not loaded. Open it again." under Show it built, and Try again failing the same way.
+  Modal's logs: every deploy (v16 16:50, v17 16:56, v19 18:07 UTC) and the 20-minute idle scale-down (17:34) started a
+  fresh process, which holds no scenes; the page kept its old scene id, so its next calls (`built/stream`, then
+  `fix/apply`, element cards for 17 minutes) answered 404. Not eviction: one to three scenes were open, the cap is 8.
+- **Server:** `_scene` and `_report` add `X-Sightline-Gone: scene:<id>` / `report:<id>` to their 404 (`_gone`; only a
+  hex id goes back in a header).
+- **Page:** `api.ts` `send` hands that to App's handler (`setGoneHandler`, `goneOf`); App shows one notice in place of
+  the calls' own errors, drops `fixes` and accepted `evidence`, hides Export, and **Open them again** (`reopenGone`)
+  reopens the same samples and runs the same check, or reopens the same sample report; uploads go back to the file
+  picker. A failed Show it built offers the reopen instead of Try again (`BuiltView`'s `reopen`). What is gone is kept
+  by id (`goneIds`) and the notice derived while rendering: clearing it in an effect let the old report's flag paint
+  once (1.4 s in Chromium) when the reopened check's report arrived.
+- **Checked:** `test_api.py::test_a_scene_or_report_the_server_let_go_says_so`; `web/tests/gone.test.mjs` (3; each
+  breaks when the error line, the fixes, Show it built's reopen or the stale-id guard is left out); 607 server tests,
+  124 web tests, build clean. In Chromium on Northbank against a local server restarted mid-session: a clash picked
+  after the restart brings the notice naming the models (its report call failed first; the scene probe followed), no
+  error line, Export hidden; **Open them again** reloads the models and the check, with no notice or error after.
+
+The ORCA notch, menu and brand in the app (Oct 30; code `web/src/Brand.tsx`, `App.tsx`, `AppMenu.tsx`, `ViewPanes.tsx`,
+`viewer/Viewer.ts`, `index.css`, `web/index.html`, `web/public/brand/`, `server/sightline/document.py`):
+- **Header:** the desktop's header bar is gone; the panels and the model reach the top of the window. The wordmark
+  (20 px) hangs from the model's top edge in a notch, and clicking it opens About ORCA. The model's top right corner
+  holds the pills, Export and **Menu**, which opens `MenuSheet` (the phone's panel) on every layout, with Panels and
+  layout on a desktop. Phones and tablets keep their bar with the wordmark or the app icon. Mockups were agreed first.
+- **Progress:** the notch grows while ORCA works (`notchStatus`: opening models with one bar segment per model, the
+  check, triage, proposing, a plan, a wider fix). While the first models open, `LoadCard` lists the real steps:
+  `open()` records the server's answer, each downloaded file and each model drawn (`Viewer.load`'s new `onDrawn`
+  callback, which yields so the count paints). Every `.spinner` is the split-O. A kept fix (`markFixed`) shows a toast
+  where the mark settles once.
+- **Brand:** navy accent and ink text from the kit's tokens; the adaptive favicon, ICO, Apple, Android and maskable
+  icons, manifest and `og.png`; a boot splash with the Reveal letters in `index.html`; the PDF cover's lockup.
+- **Tests:** `app-host.mjs` opens Models and Coordinate through the menu (`menu()`), and both stub lists name `./Brand`.
+- **Checked:** 124 web tests, build clean; server tests below. In Chromium at 1440×900 on Northbank: landing,
+  loading card (opened 4.7 s, 4 of 4 downloaded 5.1 MB, 1,961 elements drawn), working notch ("Checking the models")
+  clear of Export, loaded model, the menu, a selected clash with its chip under the notch, and the PDF cover rendered
+  with WeasyPrint.
+
+A machines pack and a persona per domain (Oct 30; code `server/sightline/domains.py`, `domain_packs/machines.md`, the six
+shared prompts, `service.py`, `plans.py`, `chat.py`, `triage.py`, `document.py`, `app.py`):
+- **Why:** every prompt said "senior BIM coordinator", so the palletising cell was triaged, fixed, chatted about and
+  reported on as a building.
+- **What:** `domains.of(ws, scene_id)` reads a scene opened wholly from STEP as `machines`, everything else as
+  `construction`. The fix agent reads `machines.md` (a mechanical integration engineer's rules for static coordination:
+  anchored frames and robot bases stay, guarding and safety zones stay intact, maintenance access, conveyor lines; never
+  a claim about robot motion), with construction's fix kinds and output contract word for word. Chat, triage, report,
+  report summary, patterns and root cause fill `{role}` per domain; construction's text is byte-identical.
+- **Checked:** `test_domains.py` (11); 618 server tests; `evals/step_cell.py` passes on the real models (17 of 17
+  planted pairs, C1, C2, C3, C6, C7, C8, Rev B 0 planted; `evals/runs/2026-10-30-cell-step-machines/`).
+
+Team names typed, titles and the rule audit by domain (Oct 30; code `domains.py`, `titles.py`, `triage.py`,
+`document.py`, `app.py`, `domain_packs/titles.md`, `triage.md`, `report.md`, `web/src/ReportDoc.tsx`, `api.ts`):
+- **Teams:** no team name is fixed any more. The report dialog has a text field per model (a cleared field goes back to
+  the guess; a list suggests the names in use). `document.TEAMS` and the web's `TEAMS` are gone. ORCA's guess stays a
+  building discipline from the model's content, and becomes the model's own name for a machine cell or a model with
+  nothing to go on. Triage's `responsible` is held to the guessed teams (`triage.schema_for`); the report translates it
+  to the typed name for that model, ranks typed names by their model's guessed discipline (`STAYS_FIRST`), and
+  `report.md` names the typed teams.
+- **Titles:** `titles.md` says `{meeting}` ("a BIM coordination meeting" or "a machine cell design review"); the page
+  sends `?scene_id=` so a cell's titles are written for its domain. **Rule audit:** `triage.AUDIT` takes `{role}`.
+- **Checked:** `test_domains.py` (14: titles and audit by domain, guesses never fixed, typed names in the report and its
+  prompt); 621 server tests; 124 web tests, build clean. In Chromium on Northbank: the dialog's first model retyped to
+  "Acme Mechanical" kept it; the second cleared and left went back to "MEP".
+
+Workings (Oct 30, owner decision; code `web/src/runlog.ts`, `workingsGraph.ts`, `Workings.tsx`, `Activity.tsx`, `App.tsx`,
+`dock.tsx`, `pilot.ts`, `index.css`, `server/sightline/agent.py`; design [docs/workings.md](../workings.md)):
+- **What:** the Activity panel draws each run as it happens, as lanes (who started it, Muse, ORCA) of steps joined by
+  edges: proposals (rounds, ideas, checks, a second try, the stop, the rank, the options), Fix together and root
+  causes (a row per item), triage (rules, alike groups, the model's calls, verdicts, dots along the busy edges), Show
+  it built (rounds, the pixel gate, judges, the retry) and ORCA's check. Follow, zoom, Fit, a minimap, event labels, a
+  timeline to replay a finished run, a picker for the last 12 runs, "in view" on the idea the pilot shows. It is the
+  panel's default view beside Steps (`W`), with an off switch in the panel and in Panels and layout; the bottom bar
+  grows to 380 px for a run and gives the room back on Steps; phones and tablets keep Steps.
+- **How:** a run log written by the trackers that already gather each run (so the chat, an agent over MCP and the
+  tour's replays show, each named), pure builders per kind, and a canvas that takes its timers and sizes from the
+  window it is in, so it works floated and popped out. The `ideas` event now names its candidates, so a round's ideas
+  show together. No new dependency.
+- **Checked:** 135 web tests (`workings.test.mjs`, 11, on the tour's recordings and fixtures); `test_agent.py` for
+  `ideas.candidates`; build clean. In Chromium on Northbank against a local server: the demo's check; a live proposal
+  on #1 (the duct) followed at a readable zoom; the cable tray with Activity floated, then popped out mid-run, `W` in
+  that window; off and on again; Fix together on #1–#3 (37 s, 18 steps); triage of all 464 (58 s); the cold-water
+  main's ideas shown together. Show it built was not run live (it spends Muse Wonder's budget).
+- **Review (PR 58):** `workings.ts` became `workingsGraph.ts` (it and `Workings.tsx` differ only in case, which breaks
+  the build on Windows and macOS); a run whose tracker finds newer work has taken over is ended then, and a detection
+  that throws or a triage stream that closes without `done` is ended too; titles come from the pair being worked on;
+  `stopAll` moved to `open()`; live runs are never let go of; meshes are dropped from logged events and Show it built
+  keeps no capture; the bar goes back only from Workings' own height; detection phases last until the next event; a
+  judge without a verdict draws; Follow's glide is no longer cut short; a newer run takes over from a picked one;
+  effects measure only when the drawing changes; the edit words come from `fixKinds.ts`; `checking.kind` matches
+  `ideas.candidates`. And the server now times each check: `attempt` has `seconds` and, for a passing fix, `checked`,
+  which a plan's `item` events pass on with the failure's `reason`; Workings shows them. 607 server tests, 136 web
+  tests.
+
+
+Collapsed side bars' strips (Oct 30; owner report; `web/src/index.css`): the active tab's underline crossed the turned
+text and the tabs touched (their padding was horizontal only). In a vertical header the tabs now have 12 px above and
+below with 4 px between, and the active one is marked on the strip's inner side. Checked in Chromium on Northbank: the
+left, right and bottom bars collapsed; web tests and build clean.
+
+Workings in the viewer, rejecting a fix, landing in view (Oct 30; owner requests; `web/src/App.tsx`, `Workings.tsx`,
+`workingsGraph.ts`, `runlog.ts`, `Activity.tsx`, `fixKinds.ts`, `api.ts`, `index.css`):
+- **A check in the viewer:** pointing at a geometry check (or its idea) in Workings shows that trial in place, teal when
+  it passed and amber with its hits lit when not; a click keeps it and takes the camera (and the view from the pilot).
+  Trials keep their pieces in the run log for the newest three proposals. [docs/workings.md](../workings.md).
+- **Reject:** beside Accept; the option folds away with an optional why and Undo, the next open option is chosen, the
+  report stops proposing it, and the next proposal (or second try) sends the rejections as `notes`.
+  [docs/edits.md](../edits.md), "Rejecting a fix".
+- **Landing in view:** when a proposal's result lands, the Clash panel (its own scroll box, never the page) scrolls to
+  Verified options, once per result.
+- **Workings is off · Turn it on** in the Activity panel's status line when Workings is switched off.
+- **Timeline alignment:** each lane's label is placed on its own bars, the clock sits on the bars' line, the first tick
+  starts at the track's edge, and the picker, Replay and speeds line up on the bars while they share its line.
+- **Docs:** the gaps found on review: `sightline.workings` and the dock's keys in 05's storage table, the run log in
+  03's proposal flow, Panels and layout's place (the Menu) in workings.md and panels.md.
+- **Checked:** 139 web tests (two new in `workings.test.mjs`, one in `fix-kinds.test.mjs`); build clean. In Chromium
+  on Northbank against a local server: the duct's offset shown on hover and kept; the cable tray's failed whole-run
+  raise kept from far out (camera to it, hits lit); the duct's only option rejected "because the ceiling void above is
+  reserved for sprinklers", the next request carrying it and Muse Spark's understanding repeating it (no other fix in
+  8 ideas, 138 s); the panel scrolled to the result; Workings off and on from the status line; the timeline on one line
+  (1,182 and 1,582 px) and wrapped (about 720 px). No page errors.
+
+Nothing fixed to one project, domain, demo or vendor (Oct 30; owner decisions: the requirements fully decide, demos get
+requirements of their own; code `requirements.py`, `domains.py`, `demos.py` and `demos/*.json`, `scene.py`,
+`service.py`, `agent.py`, `connections.py`, `context_eval.py`, `context_planner.py`, `meta_client.py`, `app.py`,
+`mcp_server.py`, the prompts, `web/src/aiNames.ts`, `names.ts`, `Requirements.tsx`, `App.tsx` and the panels):
+- **The requirements decide:** `Doc.domain` (building or machine) and `Doc.stays` (classes fixed in place, plus groups
+  allowed no edits) are new optional fields (older files keep their ids). `IfcScene.stays` replaces `FIXED_CLASSES`,
+  `agent.STAYS` and `Element.fixed` everywhere (combined steps, trims, joints, the wider fix, a second try's brief,
+  nearby clashes, plan merges), asking `Workspace.requirements_for`: the user's file, else the demo's own, else the
+  domain's default classes. Detection and requirements guess teams in the scene's domain. The dialog has "Kind of
+  project" and "Fixed in place".
+- **Demos in one place:** `demos.py` holds the demo sets, start labels, tours, the demo models' property set and smart
+  tags, and each demo's default requirements (`northbank.json`, `palletising-cell.json`, from `default_doc` with the
+  domain and classes written out). `GET /api/samples` lists them; the page picks, labels and finds the cell from them,
+  and file names lose whatever prefix the set shares (`names.ts`), not "Northbank-".
+- **Clearance:** `requirements.DEFAULT_CLEARANCE_M` replaces every 0.025; `Workspace.clearance` gives a check by hand,
+  by chat or over MCP, an opening search and the wider fix the pair's required clearance; `report.md` says it.
+- **Prompts:** `escalation.md` and `context.md` through `domains.prompt`; no example is a demo's answer any more
+  (Rev04's +400 mm duct and split 2.6-4.4 m, the cell's C6 route at 1.75-2.55 / 4.25-5.05 m); per-domain title
+  examples; triage's tolerance is the test's; no fixed 2.5 m; "fixed in place" for "structure" as a rule.
+- **Settings:** `SIGHTLINE_PUBLIC_URL` (MCP website, set by the deploy), `SIGHTLINE_MODEL_LABELS` / `_PRICES`,
+  `META_STREAMS_REASONING`, timeouts and about 20 limits; `GET /api/models` sends each role's model name and the
+  panels use it (`aiNames.ts`). Voice keywords come from the domain and the open models, not Northbank.
+- **Checked:** 629 server tests (`test_defaults.py`, 8 new), 139 web tests, build clean. Evals on the real models,
+  this branch against main: the answer key with images, 3/3 first try at Rev04 heights (+0.40, +0.25, +0.28 m) on
+  main, here with requirements off, and here with Northbank's own requirements switched on (`--requirements demo`);
+  text only, main 3/3 and here 3/3 with them on, and off #061 first try in 3 of 4 runs (its one miss found +0.28 m
+  second). `evals/step_cell.py` passes off and on (17 of 17 planted pairs, C1, C2, C3, C6, C7, C8, Rev B 0).
+  Northbank's check: 464 clashes in 1,732 elements, unchanged. In Chromium: the start buttons from the demos, the
+  requirements dialog on Northbank (Building, the eight classes), switched to Machine and a class removed.
+- **Merged with main after #61:** its Reject words name the model the server reports (`labels.proposal`), not
+  "Muse"; 629 server tests, 142 web tests, build clean.
+
+Collapsed side bars' strips, centred (Oct 30; owner report; `web/src/index.css`): turned text stacks from the right, so a
+strip tab's content sat against the right edge of the 40 px strip (22–39 px): on the left bar the text touched the
+marker line and on the right bar it sat far from it. The tab's content now fills the strip and centres across it
+(11–28 px, the same gap on both sides). Checked in Chromium on Northbank at 3× scale, both bars collapsed.
+
+Properties floating or on the right (Oct 30; owner request; `feature/properties-dock-right`; code `web/src/dock.tsx`,
+`dockLayout.ts`; [docs/panels.md](../panels.md)): a floating Properties panel has Dock Properties on the right (a tab
+after Chat); Float floats it again; where it was last put (button, Float or a drag) is kept in
+`sightline.dock.properties` and the next selection after a close or reload opens it there. With four tabs a bar's tabs
+behind the front one show as icons with a tooltip, so nothing goes behind dockview's overflow menu. Checked: 143 web tests
+(`dock.test.mjs`: the stored place); in Chromium on Northbank, float → dock right → select with Clash in front → close
+and select → reload and select (all in the right bar, no overflow) → Float → close and select (floating); the tabs get
+their names back when Properties closes.
+
+Muse Wonder's own lane in Workings (Oct 31; testing the demo video's shots; `fix/workings-wonder-lane`; code
+`web/src/workingsGraph.ts`; [docs/workings.md](../workings.md)): a proposal drew a second try's steps in Wonder's
+colour but under the "Muse Spark" lane label. A second try now adds a Muse Wonder lane under the first model's (only
+when Wonder runs), with its own timeline row. Found while testing the video's shots on a local server at `main` with
+open weights and Show it built on, which also ran Show it built live for the first time (duct #1: 85 s, gate F 0.82,
+kept) and Wonder on the tray (#2), the cell's fence post N3 (#29, ranked first) and the HMI stand (#13, no fix).
+Checked: 143 web tests (`workings.test.mjs`: the lane, its steps, bar and row); build clean; in Chromium on #29 at
+Fit.
+
+The demo video's script (Oct 31; owner decisions Oct 30; `docs/demo-video`; [docs/demo-video.md](../demo-video.md)):
+both themes as one story (our world, then the frontier), a narrator, plain words, and every shot tested first on a
+local server at `main` with open weights and Show it built on: triage on Muse Spark Open (86 s, 5 need a fix), the duct
+on Muse Spark (29 s, +400 mm at 50 mm, first idea), Show it built on it (85 s, F 0.82, both Muse Wonder judges
+faithful), Wonder beating Spark on the cell's fence post N3 (#29, a straight 360 mm move at 124 mm, ranked first) and
+on the tray (#2, a shorter offset), and the HMI stand (#13) ending in No verified fix. The footing × lift pit wall
+(#16), Wonder's Northbank case in the Oct 29 eval, is now fixed by Spark alone (a trim). The decision is in
+[20](20-decisions-limits-and-roadmap.md).
+
+The repo is `IssueLab-Inc/ORCA` (Oct 31; owner decision; `docs/repo-name`): renamed on GitHub so the link on the
+application and the submission says ORCA. Repo only: the code's internal `sightline` names stay
+([21](21-glossary-and-naming.md), "Internal names kept on purpose"). Nothing in the code or docs used the old name;
+README's "Run it" now starts with the clone. Checked: `git fetch` on the new remote, `test_docs_map.py`.
+
+Orbit round the selection and the clash (Oct 31; owner request; code `web/src/viewer/Viewer.ts`, `App.tsx`):
+- **What:** with an element selected, a left drag in the 3D view orbits round it (the middle of its box) instead of the
+  point under the pointer; while ORCA works on a clash (`clashBusy`), a drag with nothing selected orbits round the
+  clash. The camera and its target turn together round the pivot (`orbitAround`), so the pivot stays put on screen.
+  The pilot's slow turn while ORCA thinks (`orbit(true)`) first glides the view sideways to centre the clash, keeping
+  its angle and distance, then turns round it.
+- **Checked:** `web/tests/viewer-orbit.test.mjs` (2: the pivot keeps its place on screen and its distance, no roll, no
+  tilt past vertical); in Chromium on Northbank, the supply air main selected and the view orbited 6 m round it with
+  the duct at the same pixel; a proposal with the target first panned 6.4 m off the clash: autoRotate on, the target
+  glided to the clash (9 mm off) and the orbit flag on while ORCA worked; 145 web tests, build clean.
+
+A patterns reading's 502 (Oct 31; owner request to look into it; code `web/src/api.ts`):
+- **What happened:** in a live check, the automatic Insights patterns reading (`POST /api/reports/{id}/patterns/{scene}/
+  triage`) came back 502. It never reached the server: Modal's request log has every other call of that visit, and none
+  for it; the server returns 502 only for a failed requirements draft or transcription. So the gateway in front of the
+  server answered it (Modal's edge, or the cloud session's own proxy the test browser went through). The same reading
+  run again with the page left open came back 200 in 21.7 s; it is a slow, silent request (one model call, no bytes
+  until the end), and the quiet automatic reading then left the patterns unread with no word until Explain was pressed.
+- **What changed:** `api.triagePatterns` asks again after a 502, 503, 504 or no answer (twice, after 1.5 s and 4 s). It
+  cannot charge twice: `plans.read_patterns` keeps the reading per report, scene and patterns, and a caller who comes
+  while it is being made waits for it and gets the same reading.
+- **Checked:** `web/tests/gateway-retry.test.mjs` (2); web tests and build.
+
+Filter the clash list by status (Oct 31; owner request; code `web/src/ReportList.tsx`):
+- **What:** once a clash is fixed or reviewed, the list's filters offer All, To fix, Fixed and Reviewed, each with its
+  count (To fix is the old "Hide resolved" checkbox, which it replaces). The header's "N fixed" and "N reviewed" chips
+  are buttons for the same filter; with nothing fixed or reviewed the filter is off. A filter opens every group.
+- **Checked** in Chromium on Northbank: no filter before a fix; #1 fixed by a real proposal and accepted, then All 464,
+  To fix 463 (none fixed among them), Fixed 1 (#1); the "1 fixed" chip turns the filter on and off with the select
+  following; 145 web tests, build clean.
+
+
+The Triage card and the top of the clash list, laid out again (Oct 31; owner request; code `web/src/Triage.tsx`,
+`web/src/ReportList.tsx`, `web/src/index.css`):
+- **What:** before a run the card's head is "Triage" with a Step 1 pill and one line, "Find the few that need a fix",
+  and **Triage all n clashes** fills the card's width under it, folded or not (it used to share the head's line, the
+  subtitle wrapping to three); the fold now opens how triage works there too. The report's line keeps to one line:
+  "Muse Spark is naming n…" became a "Naming n…" pill whose tip names the model. The search has its own row, so its
+  hint reads whole; the filters go under it only when they change something ("In the model" when some clashes are not
+  in the open models, so not on Northbank; the status picker once anything is fixed or reviewed; "n shown" at the
+  end). Set aside and Flag share the card's width. The card lines up with the list's edges (12 px).
+- **Checked** in Chromium at 1600×1000, 1366×768 and a 390 px phone, every card state (idle folded and open, running,
+  done folded and open, with the triage answer stubbed): no wrapped subtitle or truncated search hint; no filter row on
+  a fresh report, then "228 reviewed", the status picker and "236 shown" after Set aside and To fix; the Insights
+  tab's Detect card unchanged; 145 web tests, build clean.
+
+Seat: one element bears on another (Oct 31, owner request after Northbank's #16, a lift-pit wall 500 mm into pad
+footing B1; design in `docs/edits.md` "Seat", code `edits.seat` / `apply_seat`, `agent.seat_of` / `_try_seat`):
+- **Why:** the detail a designer draws there is the wall bearing on the pad (its foot stops at the pad's face, its top
+  carries on over it). ORCA could only trim the wall's whole end or move one of them. Asked for as a capability, not
+  a fix for one clash: decided from the geometry for any pair, never a class list.
+- **What:** a seventh kind, `seat`. When an element comes down into another and stands at least 50 mm above its top,
+  its foot landing in it (at most 100 mm below its bottom), the support a straight prism under its top, the cut at most
+  half of it, neither a run nor a zone: a recess (`IfcOpeningElement` RECESS) shaped as the support's top face, from
+  below the foot to the top. The support's contact is proved by construction, not measured (the check's box depth
+  would call an L-shaped element's flush faces an overlap); everything else no closer than before. Structure reviews it
+  (`domains.SEAT_REVIEW`); the requirements treat it as a trim. Muse reads a "Bearing" line with what a seat would cut.
+- **Everywhere:** the registry (`TRIES`, `PARAMS`, `IN_TRIAL`, `KEEPS_CONTACTS`, `KEEP`, `CANDIDATE`), `Workspace.check_seat`
+  / `apply_seat`, chat and MCP `check_seat` (32 tools), both domain packs ("Seven kinds of fix"), `fixKinds.ts`.
+- **A 1 mm bedding joint:** the recess clears the support by 1 mm all round. Flush, Northbank's seated wall still
+  re-measured as -500 mm (the collision query saw the coplanar faces and fell back to the boxes' overlap).
+- **Measured:** Northbank #16 (lift pit wall into pad B1): Muse Spark proposed the seat first (13 s), verified, ranked
+  above a trim; 0.20 x 0.50 x 0.65 m cut, 10% of the wall, its top 350 mm on the pad; nothing else closer; kept in
+  place in the browser; Detect again: 1 resolved, 0 new. `tests/test_seat.py` (15); 644 server tests, 148 web tests;
+  answer key 3/3 first try at Rev04 heights (rows in `evals/results.csv`); `evals/step_cell.py` passes.
+
+No layout patches behind the load card (Oct 31; owner report; code `web/src/viewer/Viewer.ts`):
+- **What happened:** with two or four views chosen, opening models from the start page showed the layout's empty panes
+  behind "Loading 4 models": the 3D view's sky in one quarter, drawing paper in the others. The panes' headers are
+  hidden until models are drawn, but the one canvas still painted each pane's background in its rectangle.
+- **What changed:** `drawFrame` draws one empty 3D view over the whole stage while no models are open, whatever the
+  layout. The layout stays chosen and its panes return with the models. Opening models over models already open was
+  not affected: the old ones stay on screen in their layout until the new ones replace them (`Viewer.load` stages first).
+- **Checked:** `web/tests/viewer-empty-stage.test.mjs` (2; the first fails on the old code); in Chromium at 1600×1000,
+  loading Northbank from the start page in the four-view layout now shows the same even stage as the single layout,
+  and the four views (two in the two-view layout) are back once it is drawn; web tests and build.
+
+More model formats on the roadmap (Oct 31; owner decision; no code changed):
+- **What happened:** the owner asked whether ORCA could open the formats a web viewer lists (GLB, glTF, OBJ, STL,
+  PLY, 3DS, FBX, 3MF, DAE, VRML, X3D, SKP, DWG, DXF, DWF, SVG, STEP, IGES, IFC, 3DM; IES recognised only).
+- **What changed:** they wait until after the freeze, and come in only as models ORCA checks, converted to IFC on the
+  server like STEP, never as a view-only viewer; glTF/GLB first. Recorded in
+  [20](20-decisions-limits-and-roadmap.md) (an owner decision, and "Later" with what to build) and CLAUDE.md's "Later".
+- **Checked:** a throwaway script (not committed) wrote `tests/test_step.py`'s cell out as GLB and as IGES with
+  OpenCASCADE and ran each through `step.convert` with only `step._read` swapped. GLB gave the six parts, their
+  groups, metres and the same three clashes as the STEP, as meshes; IGES came in as one part with no clashes.
+
+Design tools and site data on the roadmap (Oct 31; owner direction; no code changed):
+- **What changed:** two "Later" sections in [20](20-decisions-limits-and-roadmap.md). Connectors into design tools: what
+  every connector does (send with native ids, receive kept fixes, apply them natively, moves first), then a table of
+  building, mechanical, plant and robot-cell, and coordination tools with each one's way in and how feasible it is,
+  and an order to explore. Site data aligned to the model with SAM 3.1: capture, alignment, segmentation, lifting to
+  3D, matching and measuring on the server, and what ORCA would do with it. Also an owner-decision row and CLAUDE.md's
+  "Later".
+- **Checked:** SAM 3.1 against Meta's release notes and model page (released March 27, 2026, open weights). The design
+  tools' ways in are their makers' published SDKs and APIs; none was built or tried.
+
+Every property of an object (Oct 31; owner request, "ensure we are retrieving all properties of an element"; code
+`server/sightline/properties.py` `Reader`, `web/src/Properties.tsx`; panel in [docs/panels.md](../panels.md)):
+- **What was missing:** five attributes and the type's name only; ranges, tables and complex properties came out as
+  text and reference values were dropped; no units; the type's quantities, material layers, classifications, groups,
+  documents and where the object sits were never read; an IFC4 set of property sets failed the route (500).
+- **What changed:** one reader walks the model's own relationships: every attribute (with its unit), the type and its
+  attributes, every set on the object or its type (a type-only value marked `from_type`, the object's own winning),
+  every kind of property, units (lengths, areas, volumes, masses in SI), materials with layers and thicknesses,
+  profiles, constituents and their own sets, classifications, groups, documents, storey, container and the path to
+  the project. Any object with a GlobalId can be read (`?file=` picks the model), ready for the breadcrumbs. One gate,
+  `properties.shown`, keeps the demo models' hidden note out at every depth. The panel shows it all, lengths in mm,
+  with Type badges. The filters' index reuses the reader.
+- **Checked:** `evals/properties_complete.py` on all six Northbank files: 5,666 objects, 16,303 values, every count
+  equal to an independent count from the raw relationships, 2.2 s; `tests/test_properties.py` (10),
+  `tests/test_properties_complete.py`; 649 server tests; `web/tests/properties.test.mjs` (5), 151 web tests, build.
+
+The filters' index (Oct 31; owner request, "full filtering capabilities"; code `server/sightline/facets.py`,
+`Workspace.facets`, `GET /api/scenes/{id}/facets`; design [docs/filters.md](../filters.md)):
+- **What:** every value the Properties panel shows a drawn element with that a filter can match (file, class, storey,
+  type, material, attributes, every property and quantity, classifications, groups), turned round so each value lists
+  its elements. Read with the panel's own reader, so they never disagree and the hidden demo note never reaches a
+  filter. Kept on the scene until a kept edit. `facets.matching` reads conditions as the page will, for chat and MCP.
+- **Measured:** Northbank (four files): 1,997 elements, 46 facets (System, Service, Size, Discipline, Level, Length,
+  materials, systems and zones among them), 0.8 s after the boxes, about 240 KB.
+- **Checked:** `tests/test_facets.py` (7), docs map.
+
+The Filters panel (Oct 31; owner request, "full filtering capabilities"; code `web/src/filters.ts`,
+`web/src/FiltersPanel.tsx`, `Viewer.setRules`; design [docs/filters.md](../filters.md)):
+- **What:** a Filters panel (left side bar, a tab behind Coordination; a sheet where there is no dock; "Filters by
+  property" in the Visibility menu). Each filter finds elements by models, classes, floors and any number of property
+  conditions (is, is not, contains, has, has none, between, less, more; lengths typed in mm), then colours them,
+  colours them by value (a Value | Items | Colour table, as in the owner's reference), hides or isolates them, or the
+  inverse. Several are on at once: the top colour wins, hides add up, isolates show what any finds; Show colours and
+  Grey the rest; Colour by… starts one in a click; Zoom to them; counts everywhere. The filter being edited shows live.
+  Kept per set of models, and in saved views. Viewing only: captures drop them.
+- **Viewer:** `applyMode` takes the rules' hides, isolates and colours (one scratch `Vector4`), the selection and lit
+  links leave out what is hidden, and a filter that hides the selection clears it (both gaps found in review).
+- **Palette:** ten colours, each at least ΔE 22 from every colour another role draws (pair, selection, hits, links,
+  previews, section, measure, greys).
+- **Also:** in the narrower left bar a tab behind the front one shows its icon only; "behind" is now `isVisible`, as
+  dockview's `isActive` also needs the bar to have the focus.
+- **Checked:** `web/tests/filters.test.mjs` (7), `viewer-filters.test.mjs` (3), `dock.test.mjs`; in Chromium on
+  Northbank: Colour by System (11 systems, 844 elements), ducts, pipes and trays isolated and coloured by system,
+  Level 02 Mechanical coloured with Grey the rest and Zoom to them; no console errors.
+
+Filter colours in drawings, and what drawings show (Oct 31; owner decision: shared filters with a drawing opt-out;
+code `Viewer.setDrawingsShow`, `useDrawingPaint`, `DrawingStyle.paintFill`; [docs/filters.md](../filters.md)):
+- **What:** the drawings' toggle is now three settings: what the filters leave (the default), what the 3D view shows,
+  or the whole model (no filters). Plans, sections and elevations fill each coloured element in its colour on paper.
+  A key over the 3D view says what each colour means and opens Filters. Without the dock, Filters is a sheet over the
+  model (Tools on a phone); it had been hidden under the phone's bottom sheet in the first version.
+- **Checked:** `web/tests/viewer-filters.test.mjs` (5); in Chromium on Northbank, two views: the south elevation with
+  MEP isolated and coloured by System shows each system in its colour, and The whole model brings back everything
+  uncoloured; on a 390 px phone, Tools → Filters by property → Colour by Discipline colours the model, with its key.
+
+The Properties panel, redesigned (Oct 31; owner request: "better layout and controls, icon buttons where possible,
+filter based on properties directly from the properties panel", and breadcrumbs to the selected element's parents;
+code `web/src/ElementCard.tsx`, `Properties.tsx` `PropertySets`; [docs/panels.md](../panels.md)):
+- **What:** the card moved out of `App.tsx` into `ElementCard`: a header (name, class · type), breadcrumbs (Project ›
+  Site › Building › Level, each opening that object's own properties, a storey with isolate, hide and filter by this
+  level), an icon bar (A, B, zoom, hide, isolate, section box, light links, More for the class), the links, then every
+  set. Each value's row has Copy and, where the filters' index knows it, Filter by this value, Colour by this property
+  and Isolate all with this value; Collapse all / Expand all. The card over the model folds the sets as before.
+- **Checked:** web tests and build; in Chromium on Northbank, #1's duct: Northbank › Northbank site › Northbank ›
+  Level 02; Level 02 shows its elevation (4000 mm) and `Pset_BuildingStoreyCommon`; back; the System row's Filter by
+  this value opens a filter finding 271 elements (Supply air), shown live, added; no console errors.
+
+Filters by chat, voice and agents (Oct 31; owner decision: chat and voice drive the filters; code `facets.resolve`,
+`chat.py` and `mcp_server.py` `set_filters` / `clear_filters`, `App.onChatEvent`; [docs/filters.md](../filters.md)):
+- **What:** "colour the services by system", "isolate the ducts on Level 02": `set_filters` takes filters by class,
+  level, model and property conditions, resolved on the server against the filters' index (a name the models lack
+  fails with the closest, so the model can try again; the hidden demo note is never suggested), and sends them to the
+  page as `ui filters`. Chat's own replace its last; the user's pause while they show and come back on
+  `clear_filters`. The same tools on MCP (34 tools; chat has 26). Voice goes through chat. One prompt line.
+- **Checked:** `tests/test_chat.py` (9), `test_facets.py` (9), `test_mcp.py`; `web/tests/filters-chat.test.mjs`.
+- **After a live run** (Muse Spark, "Isolate the MEP model and colour the services by system."): the first reply named a
+  system the model does not have, as `set_filters` only said how many elements each filter found. It now also says
+  each value a colour-by-value filter colours, with its count, and the page frames what chat isolated. The second run
+  listed the nine systems and their counts, and showed the services framed and coloured.
+- **Demo shots** (`docs/demo-video.md`, "Proposed"): testing Colour by Discipline with the walls and site hidden showed
+  Zoom to them framing hidden elements too, and the key listing colours no longer on screen. Zoom to them now frames
+  only what is shown, and the key lists a colour only when an element on screen has it (`filters.legend`, a test).
+
+Applying a filter zooms every view (Oct 31; owner request, "when we apply a filter, either directly, via MCP, chat,
+etc., automatically zoom into the objects in the viewer(s)"; code `filters.applied` / `zoomTarget`,
+`Viewer.frameEverywhere`, App's `ruleView` effect; [docs/filters.md](../filters.md), "Zoom"):
+- **What:** one trigger for every way in. When the filters change, App compares them with what they were: a filter
+  added, switched on or changed is applied, and once the viewer shows it the 3D view flies to what it acts on and each
+  unpinned drawing pans and zooms there (a hide-only filter frames what is left). Restoring a project's or a saved
+  view's filters does not move the camera. Chat's own framing code went: chat and MCP filters arrive as any other.
+  The card's isolates frame what they isolate; Zoom to them works in every view.
+- **Checked:** `web/tests/filters.test.mjs` (10), `viewer-filters.test.mjs` (6), 168 web tests, build; in Chromium on
+  Northbank with 3D and the south elevation: hiding the site closed both views in on the building, isolating MEP
+  coloured by System closed them in on the services, with no zoom button pressed; chat's "Isolate the MEP model and
+  colour the services by system" framed the services the same way.
+
+The review of the filters PR (Oct 31; [IssueLab-Inc/ORCA#75](https://github.com/IssueLab-Inc/ORCA/pull/75), 15 comments; the work moved to
+`feature/filters`, per AGENTS.md):
+- **Fixed:** chat's conditions with no bound or value are refused (a lone number taken as the bound), as the page
+  leaves them out; a By value filter saved before its property was picked colours by its last condition's
+  (`filters.withBy`); twenty palette colours, then Other in the key and chat's reply; level actions use the viewer's
+  own storeys and an empty isolate does nothing (no blank model before the index); a failed index request shows Try
+  again, and an unreadable element is skipped, not the index; condition rows keep their set after a removal;
+  `Viewer.isShown` builds its test once per change; a filter's name no longer redraws; the index is built outside the
+  workspace lock; a guarded quantity unit; one name for an unnamed storey (`datums.storey_name`); a complex property's
+  part by name; yes kept apart from 1 in the index; `facets.resolve` returns what it found.
+- **Checked:** `tests/test_facets.py` (13), `test_properties.py` (11), `web/tests/filters.test.mjs` (12),
+  `viewer-filters.test.mjs` (7); server and web suites; build.
+
+Checks on filters, on the server (Oct 31; owner request, "run a clash detection based on filtered elements, also via
+the MCP tools"; owner decisions: side A a filter, side B a filter, everything or itself; results replace the open list;
+code `detect.Selection.filter`, `check_id`, `check_name`, `facets.found` / `name_for`, `Workspace.check_defaults`;
+[docs/detection.md](../../docs/detection.md)):
+- **What:** a detection test's side can be a filter, found against the filters' index when the run starts. A check
+  with no id gets one from what it compares, so Detect again and a filter written another way give the same ids, and a
+  name ("DuctSegment vs Everything") that titles the run. A clash keeps its id, #N, title, views and sign-offs when
+  another check finds the same pair; runs that share no test report no resolved or no-longer-checked noise; an
+  element on both sides is never paired with itself. `detect_tests` gives a check's defaults; a run returns the tests
+  it ran so they can be repeated.
+- **Checked:** `tests/test_detect.py` (26), `test_facets.py` (14).
+- **Chat and MCP** (`chat.Chat._check` / `_side`, `PageFilter` in `ChatTurn` and `LinkContext`, `get_session`): the
+  page shares the user's filters with chat and the agent link; `detect_clashes` takes sides `a` and `b` (a filter by
+  name, or elements described as for `set_filters`; B also everything or itself), resolved and counted before a run
+  is spent, and named as the user knows them ("Ducts vs Everything"). Checked: `tests/test_detect.py` (28),
+  `test_chat.py` (12), `test_mcp.py`.
+
+Checks on filters, on the page (Oct 31; same request and decisions; code `web/src/checks.ts`, `FiltersPanel`'s
+`check`, `DetectSummary`'s `onWhole`, App's `filterCheck` and `sharedFilters`, `filters.shareable`;
+[docs/filters.md](../../docs/filters.md), "Checks"):
+- **What:** each filter's row has What do these hit? (it against everything), and Check clashes under the list picks
+  side A, side B (Everything, Itself or another filter), hard or clearance and the millimetres. The clashes replace the
+  open list; the summary says "Only <check>" with Check the open models; Detect again repeats the check, also one chat
+  or an agent ran (the run returns its tests). The page shares its filters by name with chat turns and the agent link.
+- **Checked:** `web/tests/filters-check.test.mjs` (8); web build and 179 web tests; `tests/test_docs_map.py`.
+- **Checked in Chromium on Northbank** (local server, Oct 31): a filter "Supply air ducts on Level 02" → What do these
+  hit? → 5.3 s, one clash, the supply air main × the transfer girder under the same id and #1 as in the full check,
+  titled "Coordination · Supply air ducts on Level 02 vs Everything", no diff noise; Detect again repeated it; Check
+  the open models brought back 464; the ducts vs a Structure filter from Check clashes found the same one clash.
+  Found there and fixed: going back to the full check called its 463 other clashes new; a run that shares no test
+  with the last now calls new only a clash with no number yet (`tests/test_detect.py`).
+- **The filters' index no longer waits for the opening check:** `Workspace.facets` reads its cache outside the lock too
+  (it only reads, as the requirements' inventory does). Measured on Northbank: built alone 0.9 s, during the opening
+  check 2.9 s (sharing the CPU, not waiting for it); in the browser about 7 s after the page asks, while the check,
+  four model downloads and the other first requests run.
+- **Chat, live on Muse Spark** (Chromium, Northbank): "Check the ducts on level 2 against the structure." → Muse Spark
+  took the user's filter "Supply air ducts on Level 02" as side A by name and the structural classes as side B, found
+  one clash (#1, the supply air main × the transfer girder, the full check's id), and showed it; "check my filter …
+  against everything" → one clash; Detect again then repeated chat's check under the same test id as the page's own.
+  Fixed there: chat's run in Workings is titled as chat named the check and ends with the tool (chat's runs send no
+  done event, so they showed as running).
+
+Public local setup and bundled demo data (Oct 31; owner request and licence decision):
+- **What changed:** the README now leads with the live judge walkthrough, then an explicit two-terminal local setup
+  with locked installs, uv-managed Python 3.13, Node/npm requirements, safe root `.env` creation, a key-free fixture
+  check, native PDF/GL dependencies, credential requirements, troubleshooting and root-relative test commands.
+- **Models:** six Northbank IFCs and PC-03 Rev A/B STEP files (15,443,510 bytes total) are bundled under MIT, with an
+  exact filename allowlist in `.gitignore` and newline conversion disabled in `.gitattributes`. The owner approved
+  public MIT distribution. Northbank is prominently disclosed as pre-existing synthetic baseline data, not work
+  created during the challenge; no private generator or earlier application code is copied. `samples/README.md`,
+  `BUILT_DURING_HACKATHON.md`, CLAUDE.md and map docs 17/19/20 describe the final arrangement.
+- **Checked:** all eight models match the source bytes and SHA-256 hashes; the demo registry discovers both cards;
+  unrelated samples, reports, caches and `.env` remain ignored; updated local Markdown links and all nine existing
+  architecture-map checks pass (called directly with the bundled Python runtime, without pytest). `git diff --check`
+  passes. No application behavior changed; the full server/web suites and a local browser run were not performed
+  because the project dependencies are not installed. The README explicitly leaves clean OS installs/live AI/PDF
+  checks and a verified Meta API onboarding link outstanding rather than claiming they passed.
+
+Hide the rest (Oct 31; owner: "i can filter but i can't seem to hide everything else?"; code `FilterState.hideRest`,
+`filters.evaluate` / `applied` / `migrate`, `FiltersPanel` (The rest: Show · Grey · Hide), `set_filters` `hide_rest`
+in chat and MCP; [docs/filters.md](../../docs/filters.md)):
+- **What:** Isolate already showed only what a filter finds, but only from the editor and without its colour. Now the
+  panel says what happens to what no filter colours or isolates: shown, grey or hidden. Hidden keeps the filters'
+  colours, frames what is left, and reaches drawings as any filter does; chat and agents can ask for it.
+- **Checked:** `web/tests/filters.test.mjs` (13), `filters-check.test.mjs` (9), `filters-chat.test.mjs` (2);
+  `tests/test_chat.py`, `test_mcp.py`.
+- **In Chromium on Northbank** (local server): Colour by System, then The rest: Hide → only the services, in their
+  system colours, framed; Grey → the rest back in grey; Show → as before. Chat on Muse Spark: "Show only the supply air
+  ducts on level 2 in blue and hide everything else." → `set_filters` with `hide_rest` (a first "Level 2" refused with
+  the closest name, then "Level 02"): 68 ducts and fittings in blue, everything else hidden, the user's filter paused.
+
+Windows setup fixes and updating a local checkout (Oct 31; owner setup feedback):
+- **What changed:** README Windows prerequisites now give the WinGet commands for uv and Node.js/npm, require a
+  fresh terminal for PATH, and use `npm.cmd` explicitly to avoid PowerShell's blocked `npm.ps1` wrapper. Root versus
+  web-directory commands are distinguished; macOS/Linux use `npm`. The owner confirmed Windows startup after these
+  fixes, without implying a complete browser/AI/PDF check.
+- **Updates:** README and map doc 17 document exporting in-memory edits, stopping both servers, preserving local
+  changes, fast-forwarding clean main, syncing locked dependencies and restarting. `git fetch` checks upstream
+  without changing the running checkout; Python auto-reload discards the in-memory workspace. No app source or
+  running servers were changed for this documentation work.
+- **Checked:** `server/.venv/Scripts/python.exe -m pytest -q tests/test_docs_map.py` passes all nine checks, using
+  an explicit ignored venv temp directory and disabling pytest's cache to avoid sandbox temp-folder restrictions.
+  Updated local Markdown links, README anchors and `git diff --check` pass. No application behavior changed.
+
+Orbit round the clash in focus (Oct 31; owner report; code `web/src/viewer/Viewer.ts`, `App.tsx`):
+- **What happened:** with a clash in focus and nothing selected, a drag in the 3D view turned about the point under
+  the pointer; only while ORCA worked on the clash did it turn round the clash. And while ORCA worked, a press during
+  one of the pilot's camera flights (each idea framed, the glide to the clash before its slow turn) skipped the pivot,
+  so the drag turned round wherever the flight was going.
+- **What changed:** the clash in focus (its chip shows) is the pivot too, as well as the one ORCA works on
+  (`setOrbitClash`); a press stops a flight under way, then orbits round the pivot. The selected element still comes
+  first; no clash in focus: the point under the pointer, as before.
+- **Checked:** `web/tests/viewer-orbit.test.mjs` (4; the mid-flight one fails on the old code); in Chromium on
+  Northbank with #1 in focus, a 220 px drag starting off the clash kept its marker within 3 px (the old code moved it
+  370 px), and during a proposal (stream held open, no model call) a drag kept it within 3 px; web tests and build.
+
+The corner keeps clear of the notch (Oct 31; owner report; code `web/src/App.tsx`, `web/src/index.css`,
+`web/src/ui.tsx`, `web/src/Owner.tsx`):
+- **What happened:** the model's top right corner ran under the ORCA wordmark at the top of the model: with a fix kept
+  and the owner's settings on ("1 fixed" and "owner · effort default · no caps" chips), it reached 62 px into the
+  notch at 1600×1000 and 179–222 px at 1366 and 1280; the working notch (fixed at `100cqw − 420px`) overlapped it even
+  at 1920.
+- **What changed:** the count of fixes kept moves onto Export (✓n; its tip and name say "n fixes kept"); the owner's
+  settings move onto their button, marked while on, with what is set in its tip (`Popover` `note`). The corner never
+  reaches past half the model less the wordmark's half (it wraps first); under a 1180 px model the requirements and
+  agent pills keep their icons only, and under 640 px (760 beside them) Export too; the working notch narrows to the
+  room the corner leaves (App measures it into `--corner-w`).
+- **Checked:** `web/tests/corner.test.mjs` (2; both fail on the old code); in Chromium as the owner with a fix kept, at
+  1280×800, 1366×768, 1600×1000 and 1920×1080, idle and while ORCA checks the models: the corner clears the wordmark
+  by 34–311 px and the working notch by 12–179 px, on one row. With requirements and an agent as well it still clears
+  both; at 1280 and 1366 that crowded corner wraps to a second row rather than reaching the notch. Web tests and build.
+
+Chat turns in Workings (Oct 31; owner request: "filter by distribution systems" worked in the chat but showed nothing
+in Workings; `web/src/workingsGraph.ts`, `App.tsx`, `Chat.tsx`, `runlog.ts`, `api.ts`):
+- **What:** each Chat panel turn, typed or spoken, is a run ("Chat: <question>"): what was asked, each call to the
+  chat's model, each tool with its arguments and result and what the page did for it, the answer. Tools whose work is
+  its own run (proposals, plans, checks, Show it built) say so. Agents over MCP are not drawn yet.
+- **How:** `Chat.tsx` sends the page an `asked` event before each request; `traceChat` (App) logs the turn as run kind
+  `chat`; a new builder `chat` in `workingsGraph.ts`.
+- **Checked:** 187 web tests after merging main (one new in `workings.test.mjs`; `async-ownership.test.mjs` now expects the `asked` note);
+  build clean. In Chromium on Northbank against a local server: "filter by distribution systems" drew You asked →
+  Reads the question → Set filters (colour by System, the rest greyed, 844 elements) → Reads what the tools said →
+  Answers, in about 8 s. No page errors.
+
+
+Checks take what the filters show (Oct 31; owner report: "run a clash test on the filtered items" with a Colour by…
+filter on Distribution system and By Model with Site ticked off, the rest hidden, took the Site model and all 1,961
+elements, 633 clashes; code `facets.acted` / `shown`, `detect.Selection.filter.by` / `view`, `detect.everything`,
+`chat.page_view`, `checks.viewOf` / `shownCount`, `FilterView` in `ChatTurn` and `LinkContext`;
+[docs/filters.md](../../docs/filters.md), "Checks"):
+- **What:** a filter as a check's side is what it acts on (a Colour by… filter: what it colours, values ticked off
+  left out); Everything is what the full check covers (a site model left out, as the default tests do); What the
+  filters show (every filter that is on, together, as on screen) is a side in Check clashes and for chat and MCP
+  (`{"shown": true}`), found again on every run. Chat's `[context]` and `get_session` say how many the filters show.
+- **Checked:** `tests/test_facets.py` (16), `test_detect.py` (32, the owner's case from chat with no site element),
+  `test_mcp.py`; `web/tests/filters-check.test.mjs` (11).
+- **In Chromium on Northbank**, the owner's own filters (colour by distribution system; by model with Site ticked off;
+  Hide): Check clashes offered Distribution system (844) and What the filters show (1,732, spaces aside), Check on. Distribution
+  system vs Everything: 3 clashes (the girder's three), none with the Site model (633 before); What the filters show
+  (within): 464, none with Site. Chat on Muse Spark: "run a clash test on the filtered items" → `{"shown": true}`
+  within; "check the distribution system against everything" → the filter vs Everything without Site.
+- **Check clashes laid out again** (owner: "the check button placement needs to be better", "no gaps"): the
+  tolerance or clearance on its own row, a full-width Check clashes button at the end with why it is off right under
+  it, and the block's body spaced in its own box (a `details` element takes no flex gap in Chromium).
+
+No blank page as the panels arrive (Oct 31; owner request; code `web/src/App.tsx`, `web/src/index.css`):
+- **What happened:** opening the first models from the start page, the page went blank once they were drawn (2.5 s in
+  a software-rendered test browser; a flash on a real one): the switch into the dock takes the stage, the lists and the
+  notch out of the page, and dockview lays out its panels in an effect, a few frames later. Just before, the new models
+  also showed behind the load card for a frame.
+- **What changed:** a cover over the whole window in the empty 3D view's colour, with the notch and the load card,
+  holds the switch until the stage is in its dock panel and has drawn three frames there (6 s at most), then fades in
+  0.2 s (`dockCover`). Opening from the start page on a desktop it is the loading screen itself (`coverLoading`).
+  Design and limits: `docs/panels.md`, "Into the dock under a cover". `appHost` takes a `layout` for this.
+- **Checked:** `web/tests/dock-cover.test.mjs` (2; the cover test fails on the old code). Recorded in Chromium loading
+  Northbank in the four-view layout and scanned at 10 frames a second: before, 25 blank frames at the switch; after,
+  none: the cover from 0.45 s, the stage in its panel under it at 10.4 s, the fade at 14.3 s (frames are slow in
+  software rendering) and the panels whole on the first frame after it. 189 web tests, build clean.
+
+A fix option's rows lost their grey boxes again (Oct 31; owner: "why is the background of the edit, clearance, also
+needs ... didn't use to be there"): the Filters panel's segmented choices (Colour / By value / Hide / Isolate, The
+rest) were styled as `.fact`, the class a fix option's Edit, Clearance and Also needs rows already had, so those rows
+took its grey background, border and rounded corners. The filters' class is now `.fseg` (`FiltersPanel.tsx`,
+`index.css`). Checked: `web/tests/filters.test.mjs` (14, a guard that `.fact` carries no background or border);
+Chromium on Northbank, a proposal on #1: the option's rows plain again (`.fact` background transparent, no border),
+the filters' segmented choices unchanged.
+
+Counts match between the filter list and Check clashes (Oct 31; owner: "make the counts match between the list and
+check options"; code `checks.sideCounts` / `shownCounts` / `roomsLine`, `chat.side_count`): the list said By Model
+1,768 (rooms included), the check's choices and chat 1,732 (rooms left out: no solid body to clash). Now every place
+says the list's number, and a line under the choices names the rooms a check cannot test ("36 rooms in By Model aren't
+checked"); chat's side counts carry `rooms_not_checked` (Everything counted the same way) and its reply says them.
+What is checked is unchanged. Checked: `web/tests/filters-check.test.mjs` (12), `tests/test_detect.py` (33); in
+Chromium on Northbank with the owner's filters, the list and the choices both say 844 and 1,768, the rooms line shows
+only for a side with rooms, and chat (Muse Spark, "check By Model against everything") said "1,768 elements on each
+side, but 36 on each side are rooms with no solid to clash, so 1,732 checked".
+
+Kept checks: several clash checks at once (Oct 31; owner: "with ORCA's clash detection, at any given point, we only
+have the results of one clash check … implement the ability to have multiple"; owner decisions: the latest result of
+each check, one list with a picker, one #N per clash across every check, triage verdicts follow the clash; code
+`server/sightline/checks.py`, `Workspace.detect` / `detect_all` / `remove_check` / `union_report`, `detect._assign_ids`,
+`triage.Job(only, scope, on_reading)`, `app._narrowed`, `web/src/Detect.tsx` `CheckPicker`, `checks.ts` `narrow` /
+`pruneFixes`, App's `adoptRun`; [docs/detection.md](../detection.md), "Kept checks"):
+- **Before:** the server kept only a scene's last run (`_runs`, `_run_reports`, `detections`), linking ids, numbers,
+  titles and views to the run before; the page held one report and every run wiped fixes, plans and the chat. Full
+  check → check A → check B gave B new ids and numbers for pairs the full check had numbered; full → check → full could
+  never say what was resolved; captured views went with an evicted report; triage was per report, paid again per run.
+- **Now:** each check (the open models, each check on filters) keeps its latest run, diffed against its own last run;
+  one list of every kept check's clashes (a clash two checks found is one row naming both), a new list per change;
+  ids, numbers (no restart under new requirements), titles, views and triage readings kept with the scene, so a list
+  dropped by the report cap is made again with no run. The page keeps its work across runs (a fix's mark until the
+  check listing its clash runs again), shows a picker over the list (All checks or one, Run again, Remove, Run all
+  again, which ran before a fix) and the triage card's "Triage N unread". Triage carries a reading free while the pair
+  is the same and the depth moved no more than 1 mm under the same prompt, and asks only about the unread clashes of
+  the check on screen. Chat and MCP: `detect_clashes(check=…)` (a kept check by name, or "all"), `list_clashes(check=…)`,
+  `get_session` lists the checks, `generate_report(check=…)`. Routes: `GET`/`DELETE /api/scenes/{id}/checks`,
+  `DetectRequest.check` and `all`. `SIGHTLINE_MAX_CHECKS` (12).
+- **Checked:** `tests/test_checks.py` (13), `test_detect.py` (33), `test_api.py`; `web/tests/checks-list.test.mjs` (7),
+  `filters-check.test.mjs` (12); 694 server tests, 200 web tests, build clean. On Northbank against a local server
+  (this container's CPU): the full check 464 clashes in 5.1 s; a ducts check 1 clash in 2.2 s, the supply air main
+  under the full check's id and #1; a beams check 240 clashes in 0.6 s with all 15 transfer-girder clashes under the
+  full check's ids and numbers; 464 rows with unique numbers; Run all again (3 checks) 7.0 s. In Chromium, resuming
+  that session: the picker (All 2 checks · 464, the open models, the ducts check), the ducts check's one clash
+  triaged by Muse Spark, Run again on it keeping the verdict free, and All checks showing "Triage 463 unread".
+
+The review of the kept-checks PR (Oct 31; [IssueLab-Inc/ORCA#87](https://github.com/IssueLab-Inc/ORCA/pull/87), 10
+comments, all taken):
+- **Fixed:** a failed triage read (error, no verdict) is no longer kept and carried as read: it stays unread
+  (`Register.keep_reading`, `carried`, the page's count); a run that asks the model nothing makes no audit call and
+  keeps the last audit (`Job(prior_audit)`); titling is one run per scene, a new list following the one under way
+  and asking again for what it adds (`_title_key`, `_kept_titles`, the start's `report_id`); a reading reaches a new
+  list only for a clash that did not change, on the server (`checks.same_clash`, `_same_in`, the followed stream
+  filtered and marked `following`) and the page (`sameClash`); a key used again moves to the end of the jobs' cap
+  (`_keep_job`); a one-check PDF says that check's test names (`_narrowed`); check summaries, contacts and lookups
+  iterate a snapshot; Triage while a run is under way follows it when it reads those clashes, else is charged once and
+  queued behind it (`Job(after, prepare)`, `queued`, `asking`); one name lookup (`checks.pick`) and one settle test
+  for the run and its charge (`triage.settled_by`).
+- **Checked:** `tests/test_checks.py` (20), 701 server tests; `web/tests/checks-list.test.mjs` (8), 201 web tests;
+  build clean.
+
+Proposal clips in the README (Oct 31; owner: "show some actual clash proposal generations in the main readme", "show
+the workings as well, and a zoomed-in version"): a new "See it work" section near the top shows live proposal runs as
+animated WebP time-lapses in `docs/media/proposals/`: Northbank #1, #2 and #3 and the cell's #66, each from picking
+the clash to the verified option and Before / After, and the Workings of #1 and #66 replayed in Activity's own window.
+`web/scripts/capture-proposals.cjs` records them from Chromium's screencast (Playwright's video recording starved the
+page under SwiftShader and the proposal never finished) and `web/scripts/timelapse.py` speeds the waits up 2-6× with
+the speed on each frame. Checked: the four runs made by the committed script against a local server with Muse Spark,
+each with one verified option (duct +400, tray +250, cold water +280: Rev04's heights; air line −150 under both
+rails); frames inspected; `tests/test_docs_map.py` passes.
+
+A fixed clash left the clash list when selected (Nov 1; owner: "when i click on a fixed clash, the item disappears from
+the list of clashes. however, when i click on another item that isn't fixed, it shows up again"; code
+`noClash.shownVerdicts`, `ReportList`'s triage filter):
+- **Cause:** with the list filtered by a verdict ("real"), the selected clash alone gets ORCA's live measure, and for a
+  clash fixed in this session that measure finds no overlap; the list's verdict overlay then read it as "not a clash:
+  no overlap here" (by design), so the "real" filter dropped it until another clash took the measure. The clash panel
+  already left fixed clashes out of that reading; the list did not.
+- **Fix:** a clash with a kept fix keeps its triage verdict in the overlay (moved from App into
+  `noClash.shownVerdicts`, so it is tested with the real `noClash`), and the selected row stays while a verdict filter
+  is on, as selecting a clash can change its shown verdict.
+- **Checked:** `web/tests/clash-list.test.mjs` (2; the old reading fails the first), 203 web tests, build clean.
+
+Quick actions on a clash row (Nov 1; owner: "when we hover on a clash in the list of clashes, i want to see control
+icons button to quickly propose fixes", "also when we hover, additional capability to see clashes with the same
+elements"; owner choices: Propose fixes, Mark as not a clash and Same elements, the last narrowing the list to clashes
+sharing either element; code `ReportList` `RowActions` / `sameElements`, App's `proposeFromList`):
+- **What:** hovering a row (or focusing it, or the selected row on a touch screen) shows icons over its right end:
+  Propose fixes (selects it and proposes once its own pair is picked; only when both elements are in the model and it
+  may need a fix), Mark as not a clash (as the panel's button), and the count of other clashes sharing an element with
+  it, which narrows the list to them with the list's focus chip ("Clashes with Supply air main L02 600x300 or Transfer
+  plate girder 1000 deep · 15").
+- **Checked:** `web/tests/row-actions.test.mjs` (3), 204 web tests, build clean; in Chromium on Northbank against a
+  local server, hovering #1 shows the three actions over the depth with the title still readable, and Same elements
+  shows the 15 clashes on the supply air main or the transfer girder.
+
+A clash row shows its proposal (Nov 1; owner: "something needs to show on the clash that a proposal is being generated
+and that it's ready when it is with a link to bring up the proposal section to view if its not"; owner decision: it
+runs on in the background for its own clash, one at a time, and a finished one is kept per clash; code App's
+`trackAgent` / `running` / `runState` / `doneProposals` / `viewProposal`, `ReportList`'s row status):
+- **Found on the way:** opening another clash while a proposal ran let that run's progress and result land on the new
+  clash's panel (`resetWork` cleared the panel, but the tracker kept writing to it), and a finished proposal was lost
+  when another clash was opened.
+- **What:** a proposal belongs to its clash. The tracker keeps its own progress, proposal and thoughts and writes the
+  panel only while that clash is on screen (the pilot too); its row says Proposing…, then "N fixes ready" or "No fix
+  found", with View when it is not on screen (another clash, or another panel in front), and View in the hover actions
+  instead of Propose. Opening the clash again shows its proposal without a new request. A second proposal waits
+  ("Waiting for #N"); the notch says "Fixing #N" for the running clash.
+- **Checked:** `web/tests/proposal-status.test.mjs` (2), 208 web tests, build clean. In Chromium on Northbank against
+  a local server with Muse Spark: #1 proposed from its row showed Proposing…, kept it with #2 open (whose panel stayed
+  empty), then "1 fix ready · View"; View brought up #1's Verified options.
+
+Isolate a clash's elements from its row (Nov 1; owner: "a new hover button that will isolate only the clashing
+elements, if its on for a clash, clicking another clash should go straight to it and isolate it too, until the user
+removes the isolation"; code App's `isolating` / `isolateClash` / `endIsolation`, `ReportList` `RowActions`):
+- **What:** a row's Isolate (the element card's Isolate icon) isolates the clash's two elements through the page's
+  "for now" isolation (`temporary`), with the pieces a kept fix added to them, and takes every view to the clash. While
+  on, each clash opened after (row, chat, next) goes straight to its own pair, isolated, with "Clash #N isolated · Show
+  all" over the model; Show all, the toolbar's Reset or the button again on the isolated clash show everything, and the
+  element card's own hide or isolate replaces it.
+- **Checked:** `web/tests/isolate-clash.test.mjs` (2), `row-actions.test.mjs` (4), 211 web tests, build clean; in
+  Chromium on Northbank against a local server: #1 isolated shows only the supply air main and the girder, #2 then
+  only the cable tray and the girder, Show all brings everything back.
+
+Edit by hand, and one edit log for everything (Nov 1; owner: "basic manual (possibly via ai as well) editing on
+objects ... select a face and increase / decrease length, align a face to another face, create a void, cut an object
+... the key thing too is that all edits are tracked and can be fed to muse, for our reports", "say muse proposes a fix
+and i accept it, and then i manually make some changes ... i want that to be known, not just in the geometry";
+owner decisions: the full toolset before the freeze; Keep with N clashes, never verified, the clash listed; the
+requirements bind, ORCA's hard rules warn; cut means split and remove a section; the person's own "keep it" in chat
+or voice keeps; [docs/manual-edits.md](../manual-edits.md)):
+- **The edit log** (`journal.py`): one entry per keep (fixes, plans, wider fixes, MCP keeps, hand edits), with who,
+  what, the clash, the fix a hand edit follows (lineage), its check and warnings; undo and redo over each file's
+  transactions (a wider fix by its state). **Found on the way:** a trial move outside a transaction broke the next
+  undo (`UndoSystemError`), so trial moves run in `edits.scratch`; `file.redo()` would replay trials, so the log
+  holds its transactions; files keep 1,024 transactions.
+- **Hand edits** (`faces.py`, `manual.py`): faces named as people say them; push/pull (depth, a rectangle's side, a
+  radius, an outline's edge), align, move, void, cut by shape, split, remove a section, delete, clip; each gated by the
+  requirements, checked in a trial (cleared, new, worse) and checked again on keep. Routes `/edit/face`,
+  `/elements/{id}/faces`, `/edit/check`, `/edit/apply`, `/edits`, `/edits/undo`, `/edits/redo`, `/edits/{id}/picture`.
+- **The page:** the Edit tool (P) with animated icons (`editIcons.tsx`), lit faces, a draggable arrow with a live
+  stretch preview, Keep / Keep with N clashes; the Edits panel; Ctrl+Z and Ctrl+Shift+Z; patches that remove elements.
+- **Muse and agents:** chat `list_faces`, `edit_check`, `edit_keep`, `undo_edit`, `list_edits` behind a consent gate
+  on the person's own words; the selection and recent edits in chat's context; proposals told of earlier edits; MCP
+  `list_faces`, `check_edit`, `apply_edit`, `list_edits`, `undo_edit`, `redo_edit`.
+- **Out:** the report's "What was done" per clash ("Fix applied, then edited by hand, still resolved") and "Changes to
+  the model", BCF comments and Request topics, `ORCA_Edit` on edited elements in the exported IFC, `orca-edits.json`
+  and `.csv` in zips, deleted STEP parts removed from the STEP.
+- **Checked:** `tests/test_journal.py` (9), `test_manual.py` (23), `test_chat_edits.py` (4), `test_edit_log_out.py`
+  (5), an MCP and a STEP test, 750+ server tests; `web/tests/edit-helpers.test.mjs` (4) and a patch test, 213 web
+  tests, build clean; answer key 3/3 first try at Rev04 heights after the trial-move change. In Chromium on Northbank:
+  P, a click on clash #1's duct top (0.300 m), 50 mm typed, "Makes 1 clash: girder −350 mm", Keep with 1 clash, the
+  model patched and the kept checks run again; the Edits panel, Ctrl+Z and Ctrl+Shift+Z. Chat with Muse Spark: "check
+  pushing the top face of its duct up 50 mm" opened the check in the Edit tool (Makes 1 clash), and "Keep it with the
+  clash." kept E1 as Muse's; with a bracing member selected instead, Muse said it has no top face and kept nothing.
+  Against the live server: Muse's fix for the duct and girder (offset +400 mm, 50 mm clear) kept as E1, then the middle
+  piece it made pulled 20 mm in by hand: E2 follows E1, carries the clash, and the clash is still resolved. Answer key
+  3/3 again at the end. `evals/step_cell.py` was not run: the demo-models checkout is not in this session.
+
+**Nov 1, fewer restrictions on editing by hand** (owner testing of the Edit tool: "too many restrictions"). Faces for
+every body (`edits.solids`: each solid of a Body, ids prefixed `i1:` only when there are several; mesh faces that push
+by moving their corners; an I, U, C, L or T section's outer sides; a clip's plane), align at first contact up to 80°
+apart with Clip it flush offered, and to a corner or an edge point, joints that follow (a collinear segment stretches)
+or are left open behind "Keep with 1 open joint" (`accept_joints` on the route, MCP and chat's "joint"), Move it alone,
+void, split, remove a section and clip on any body by half-space clips (`edits.split_by_clip`, `_clip_items`), people's
+5 mm minimum, shared bodies copied, turned rectangles. On the page: the drag stretches every drawing of the element
+live with its distance at the arrow, align previews from the two picks, a face the tool cannot take offers the tools it
+does, and Undone sits in an Edits row's header. Measured: all 1,732 of Northbank's physical elements now have a face to
+push (was 1,324), listed in 1.6 s; a diffuser's side, a door's bottom and a UB 457's flange check in 0.1–0.7 s; 312 of
+the MEP model's mesh faces push cleanly, the rest are joined ends. Checked: 761 server tests, 218 web tests,
+`test_docs_map`, the answer key 3/3 first try at Rev04's heights (+0.40, +0.25, +0.28), and in Chromium the duct's top
+dragged up live ("+440 mm" at the arrow) then checked on release. Design: [docs/manual-edits.md](../manual-edits.md).
+
+**Nov 1, review of PR IssueLab-Inc/ORCA#92** (13 threads), and `main` merged in (its row Isolate; conflicts in
+App's scene reset and this log, both sides kept). Fixed:
+- **Openings:** a push takes only the openings through the pushed face, for caps, sides and outline edges (a plan-drawn
+  wall's door now goes with its face; a beam's web opening stays when its end is pushed).
+- **Chat consent gate** (`chat.consents`, `accepts`): a bare "keep" is not consent; nothing is kept in the turn Muse
+  checked it unless "keep it" is all that was said; clashes and open joints only when kept *with* them; every undo word
+  negated, "go back" dropped.
+- **Clash state:** undo and redo return each clash measured again (`clash_states`) and the page acts on that, not on
+  the entry's source. A hand edit is tied to the clash on screen only when it touches its elements.
+- **Caps:** the run after a hand edit has its own cap (`edit_rerun_limit`).
+- **Smaller:**
+  - a partial face name several faces fit is refused with the candidates;
+  - holes drawn as indexed poly curves are read (`faces.curve_points`);
+  - a fix's pieces are measured on one index (`detect.measure_pairs`);
+  - structure and transfer rules live in `hosts.py` (a machine's beam gets no structural review);
+  - `IfcScene.has` replaces two copies of `_exists`;
+  - chat keeps no preview meshes pending;
+  - clash ids in Muse's edit lines are no longer written as `#`;
+  - the palette says P again stops editing.
+
+Checked: 771 server tests, 222 web tests, build clean, `test_docs_map`.
+
+**Nov 1, hand edits change the face or element picked only** (owner: "when we are extending a face, it's pulling
+everything"; [docs/editing-parity.md](../editing-parity.md), slice 0a). Push/pull, align and move no longer take joined
+parts along by default: a joint they leave open is listed and kept only as **Keep with N open joints**. `carry: true`
+(`manual.carries`; the Edit tool's **Take joined parts along**, off by default, kept for the visit) brings back the
+following segment and the carried run; a carried move that cannot keep its joints offers **Move it on its own**. The
+fix agent's moves are unchanged. Also: the export's `orca-edits.csv`/`.json` are written as UTF-8 with the CSV's own
+line ends (Windows wrote cp1252 and doubled carriage returns). Checked: 768 server tests pass (the five that fail on a
+clean checkout of this branch on this machine fail the same: two detection, two PDF fonts, one voice socket), 222 web
+tests, build clean; in Chromium on Northbank, the supply main moved up 50 mm on its own (two tees left open, kept as
+E1 with "Keep with 2 open joints", Ctrl+Z undid it), and carried it is refused past 12 parts with the offer.
+
+**Nov 1, hand edits can no longer leave a model saying two things** ([docs/editing-parity.md](../editing-parity.md),
+slice 0b). Northbank carries none of what real exports do (layer and profile set usages, `Axis`, path joins, bodies
+from a type), so those paths were never exercised. New `fixtures.build_parametric_fixture` carries all of them, built
+with `ifcopenshell.api`. New `consistency.py` reads, per element and rule, what a consistent edit keeps, and
+`manual.check` compares the reading before an edit with the one in its trial: what it made worse is refused in words
+with the numbers ("the material layers of wall 'W1' add up to 250 mm but its body would be 300 mm thick…"), stale
+base quantities warn, and a model that was already inconsistent never blocks. `test_parametric_edits.py` runs every hand
+edit on every construct: kept consistent or refused, nothing in between. Measured: on a Northbank wall the check takes
+0.38 s with it and 0.40 s without (Northbank's only base quantities are on spaces, which are not edited). Checked: 796
+server tests pass (the same five environment failures), `test_docs_map`; on the running server, the fixture uploaded
+through `/api/models/upload`: a layered wall's thickness refused with its numbers, its height allowed with the
+quantities warning, a beam lengthened past its axis refused, and keeping a refused edit answers 409.
+
+**Nov 1, hand edits bring the model's data along** ([docs/editing-parity.md](../editing-parity.md), Tier 1). New
+`parametric.py` runs after every hand edit, in the trial and when kept: a layered wall or slab's layer on the pushed face
+grows or shrinks (the reference line held), a profile set's material profile becomes the new section, the `Axis` follows
+the body's ends (and a split's piece gets its own), base quantities are worked out again (`quantities.py`, only those
+already there), and a path join goes to the piece of a split that holds its end or is left open as a joint. Shared data
+is copied for the edited element alone (owner decision): its own type "… (ORCA)" when its type gave the set to others, its
+own set otherwise; a type's mapped shape becomes the element's own copy (`edits.unmap`, faces read through the map), the
+type and its other elements unchanged. A new `shared` consistency rule refuses a shared set changed in place: it caught
+the first version, where assigning the copied type left the usage on the old set and W2's layers moved with W1's.
+Checked: 804 server tests pass (the same five environment failures); the matrix keeps all 24 edits and reads the whole
+model again after each (every layer set, profile, axis, join and quantity matches its body, everything else as it was,
+the file schema-valid; the first run found the old shape `unmap` left behind, now removed); on the running server, the
+fixture uploaded, four edits kept (a wall thickened, a beam lengthened, a mapped fitting pushed, a wall split) and
+exported: W1 "WT-250 (ORCA)" 300 mm, W2 still 250 mm, the join on "W1 (part 2)", F1 its own extrusion and F2 still
+mapped, `ORCA_Edit` stamped, no schema issues; six edits undone leave the file valid with F1 mapped again.
+
+**Nov 1, MEP by hand: offset, join, disconnect** ([docs/editing-parity.md](../editing-parity.md), Tier 2). Three hand
+edits on the fix kinds' geometry: `offset` (a section of a level duct, pipe or tray up, down or sideways square to its
+run, with bends: `edits.apply_offset`), `join` (two free ends in line, or square with a 90° bend fitting:
+`edits.join_plan`, `join_segments`) and `disconnect` (a joint left open, kept as one). Edit tool keys F, N and X, with
+animated icons; Muse and MCP read the ops. Two fixes found on the way, both older than these tools: a point clicked for a
+split, a section or an offset snapped through the see-through context to the slab above a clash pair (now it snaps
+only to the element picked), and the tool's number fields refused values off their step (400 mm on a 10 mm step from
+1, a void's 300 mm on 10 from 5), so their Check did nothing (the forms are now `noValidate`; the server checks every
+op). Checked: 812 server tests pass (the four environment failures), 223 web tests, build clean; in Chromium on
+Northbank, clash #1 offset by hand 400 mm up over 2.48 m: "Clear · nearest 50 mm · clears 1 clash", kept as E1, the
+clash marked fixed ("no overlap here"), Ctrl+Z undid it.
+
+**Nov 1, what the model says, edited** ([docs/editing-parity.md](../editing-parity.md), Tier 3). New
+`property_edits.py`: an element's attributes, a value in its own property sets, its type, material, classification and
+storey changed through `ifcopenshell.api`, each an edit-log entry (kind `property`) undone and redone as any edit and
+stamped in the export; refused in words where the model would say two things (base quantities, a type's own values, a
+layered element's material or type). Routes `GET …/property-choices` and `POST …/properties`, MCP `edit_property`, and
+Muse's `edit_property`, kept only when the person's own message says the value. The Properties panel has a pencil on
+the element's editable rows (typed, or chosen from its own model), and now reads the element again after every keep,
+undo and redo: before, a hand edit's new size or an undone change stayed on screen until another selection. Checked:
+820 server tests pass (the four environment failures), 225 web tests, build clean; in Chromium on Northbank, the supply main's Tag
+changed in the panel, kept as E1, Ctrl+Z and Ctrl+Y followed by the panel; its storey moved Level 02 → Level 03 from
+the list.
+
+**Nov 1, Muse's fixes keep the model true** ([docs/editing-parity.md](../editing-parity.md)). The offset, trim, seat, route and resize trials and a plain move now bring layer and profile sets, `Axis`, base quantities and a split's join along with the body (`agent._fix_trial`, `_keeps_true` over `parametric.sync` and `consistency`), and fail with the reason when the model would still disagree or a wall's join would be left open; Muse reads it next round. `plans.apply` does the same after each kept fix and refuses all of them when one disagrees. Elements with nothing to keep (all of Northbank's) skip it. Checked: `test_fix_consistency.py` (a typed beam trimmed back to a column keeps its axis and quantities at 4.8 m; a move off a wall's join refused in its trial and when kept), the fix kinds' suites unchanged.
+
+**Nov 1, bends at any angle** ([docs/editing-parity.md](../editing-parity.md)). Bends are drawn for any angle (`edits.bend_turn`, `bend_end`, `_bend_mesh`; 90° unchanged) and an offset can climb a slope with angled bends either end (`apply_offset(bend_deg=)`, 15 to 90): the Edit tool's offset has 90° / 45°, Muse's offset candidate takes `bend_deg` (construction and machines prompts say when), carried in its option to the recheck and the keep. Checked: `test_mep_edits.py` (a 45° offset by hand is one joined chain with its middle 400 mm up, schema-valid; Muse's 45° offset kept as tried), the offset, route and fix-kind suites unchanged, 225 web tests, build clean.
+
+**Nov 1, transitions on a carried resize** ([docs/editing-parity.md](../editing-parity.md)). A duct's or pipe's side or radius pushed with Take joined parts along now adds a transition fitting back to the old size at each joined end (`edits.add_transitions`, `section_of`, `joined_caps`, `_loft_any` for rectangles and round), the segment shortened so no face turns more than 30° and its ports re-joined through it; pushed on its own it warns that its end no longer matches. Checked: `test_mep_edits.py` (the run fixture's main 500 wide, a 173 mm transition to the end segment, undone; a pipe made 150 mm with a round transition to the pipe it joins), schema-valid.
+
+**Nov 1, classifications from the panel** ([docs/editing-parity.md](../editing-parity.md), Tier 3). A classification row's pencil swaps the reference for another in one change (`replace`: one entry, one undo) or takes it off; **Add a classification** gives the element one more of its model's references. `properties.py` now gives each classification its id, and a reference the element already has is refused in words, never given twice. Checked: `test_property_edits.py` (swapped in one entry and undone, W2 keeping its own; a duplicate and taking off one it does not have refused), 226 web tests.
+
+**Nov 1, apply to the type** ([docs/editing-parity.md](../editing-parity.md)). A push/pull or align can change what the element's type gives for every element of it (`scope: "type"`; the Edit tool's **Apply to the type**, off by default and again for each element; Muse and MCP use it only when asked for the type or all of them). A mapped body's new solids go back into the type's map through the inverse of where the element's map puts them, and the element draws it through the map again; a profile set takes the new section and each other element takes it about its own axis (`parametric.type_share`, `hold`, `to_type`). The other elements are targets: checked for clashes, gated by requirements, their quantities worked out again. A layered type, an element without a type, a length and every other op are refused in words. Checked: `test_parametric_edits.py` (F1's top 100 mm taller makes F2 taller too, both still mapped, undone with every element and map as it was; F2's turned north end makes F1 longer along x; BT-UB 450 mm deep with BM2 grown about its axis and no type copy; four refusals), schema-valid.
+
+**Nov 1, a carried wall end** ([docs/editing-parity.md](../editing-parity.md)). A wall moved with Take joined parts along now brings each wall whose end is path-joined to it along (`manual._retrims`): that end is pushed along its own axis so it meets the moved wall as it did, through the hand edits' own push, so its axis, layers, quantities and openings follow and its refusals hold. A wall moved along its own line, or a join in line with it, is still left open and listed. Spiked first: a carried move left every path join open; `geometry.regenerate_wall_representation` was set aside because it redraws a wall from its layers. Checked: `test_parametric_edits.py` (W2 moved 500 mm east: W1 4.5 m, its axis, quantities and join holding, nothing else changed, undone; W1 moved north shortens W2 to 2.5 m; a move along W1's line leaves its join open), schema-valid.
+
+**Nov 1, Muse and agents use the new edits** ([docs/editing-parity.md](../editing-parity.md)). Muse's chat rules and the `edit_check` / `check_edit` texts say when to take joined parts along and when to apply an edit to the type (only when asked for the type or all of them), and `edit_property` names a classification swapped in one change (`replace`). Muse's fix proposals already take `bend_deg` and keep the model consistent. Checked: chat, MCP and property edit suites unchanged (30 passed).
+
+**Nov 1, a beam's axis stays at its cardinal point** ([docs/editing-parity.md](../editing-parity.md)). A side of a profiled element pushed grows its body to that side, and its axis now goes back to the section's cardinal point (`parametric._cardinal`): the placement moves across, the body back by as much, what is placed in it stays. A new `cardinal` consistency rule reads where the cardinal point is from the axis (`consistency.cardinal_offset`, points 1-9 on the section's box, 10-15 for sections symmetric both ways). Checked: `test_parametric_edits.py` (BM1's top pushed 50 mm: body 2.8 to 3.25 m, axis at 3.025 m, undone; a bottom-centred beam's axis moves only with its bottom), `test_consistency.py` (a body moved off its cardinal point is caught).
+
+**Nov 1, a layered type made thicker for every wall** ([docs/editing-parity.md](../editing-parity.md)). Apply to the type now takes a face square to a wall's or slab's layers: the layer on that face grows in the type's own set and every other wall of the set has the face holding that layer pushed by as much (`parametric._grow_layers`, `manual._push_face`), reference lines kept; `parametric._layers` leaves layers that already add up. Checked: `test_parametric_edits.py` (W1's north face 50 mm: WT-250's insulation 85 mm, W2 50 mm thicker on its west face, both 300 mm wide in their quantities, undone; a plaster layer pulled through refused), schema-valid.
+
+**Nov 1, Muse's wall moves keep their joins** ([docs/editing-parity.md](../editing-parity.md)). A fix's plain move of a wall square to a wall path-joined at its end now brings that end along (`agent.joined_ends`, `follow_joined`, over the hand move's `manual._retrims`) instead of failing on the open join: tried, previewed (`edit.follow`), kept (`plans._keep_move`) and checked with other fixes (`_in_trial_move`), the end's file held with the move's. Checked: `test_fix_consistency.py` (W2 moved 300 mm east: W1 4.3 m, its Length and join, one entry, undone; a move along W1's line still refused with the open join), fix kinds, plans and agent suites.
+
+**Nov 1, a carried move re-fits its neighbours** ([docs/editing-parity.md](../editing-parity.md)). A hand move with joined parts re-fits a level straight it goes square to, when that straight is joined at its far end too: its joined end goes with the move and a pair of bends and a riser take it back to the rest, which stays (`connections.plan_move(refit=True)`, `Jog`, `edits.apply_jog`, `jog_fits`; `_build_chain(shift_ends=)` moves the joined end's port frame). Free-ended straights are still taken along whole; Muse's moves plan as before. Checked: `test_mep_edits.py` (DA lifted 400 mm with an air terminal beyond DB: refused before, now every joint held, the terminal unmoved, schema-valid, undone; a free-ended DB still taken whole), the move, journal, STEP, chat and MCP suites; on Northbank 664 carried 400 mm plans keep their joints 370 times (102 before), and 40 applied in trials hold every joint.
+
+**Nov 1, Muse's moves re-fit too** ([docs/editing-parity.md](../editing-parity.md)). The fix agent's moves plan with re-fits (`connections.refit_moves`, `SIGHTLINE_MOVE_REFIT`, on unless `off`): the re-fit's pieces are checked as stretched segments are (`baseline`, `check_applied`), drawn in the preview, carried in the option (`edit.jogs`) and kept by `Workspace.apply` with the pieces in `changed`; combined fixes' move steps do not re-fit yet. Two joints-fixture tests now see a lift tried and failing on the column it runs through, where before it was refused untried for the filter beyond; with the switch off they read as before. Checked: `test_mep_edits.py` (Muse's lift of DA re-fits DB, kept as tried, the terminal still joined, 4 parts made, undone; refused with the switch off), `test_connected_moves.py`, fix kinds, plans and agent suites.
+
+**Nov 1, the answer key after the editing program** (`evals/answer_key.py --runs 1`, Muse Spark 1.3, effort low, re-fits on for Muse's moves). 3/3: each first candidate passed at Rev04's own height, #042 +0.40 m, #057 +0.25 m, #061 +0.28 m, with 50, 50 and 53 mm clearance, as the last recorded run; 19, 19 and 24 s. #042's second candidate, the same offset on 45° slopes, passed too. The whole-run lifts and drops Muse also tried failed on what they hit (ducts, dampers, walls, lights), so the re-fit stays on (`SIGHTLINE_MOVE_REFIT`). Rows in `evals/results.csv`.
+
+**Nov 1, hand edits on real Revit models** ([docs/editing-parity.md](../editing-parity.md), "Real Revit models"). Every hand edit checked on Autodesk's Snowdon Towers sample (six IFC2X3 files, Revit 2027, feet; local only): 1,644 checks, 1,493 made, 91 refused in words, 60 errors (one bug) and a native crash. Fixed: IFC2X3 ducts and pipes (`IfcFlowSegment` by type: `edits.segment_kind`, `fitting_class`, fittings as faceted breps, `mesh_item`); side branches kept on the piece that stays or refused naming them (`_branch_home`); a split of a surface body (Revit's toilets) crashed OpenCASCADE, now refused in words, and a sweep of 75 edits on 25 surface-bodied elements in a crash-restarting process found no other; IFC2X3 classification codes (`property_edits.ref_code`) and owner history; a void's fallback depth overwrote its direction; named refusals for joined walls and layerless siblings. Clash checks: threads (`SIGHTLINE_GEOM_THREADS`), a digest-keyed cache of heavy neighbours, one edit's neighbours shared before and after: a type of 100 fittings 66 s to 13 s, a toposolid's 19 s once. Checked: the harness on all six files, tests for each fix (`test_mep_edits.py` IFC2X3 and branches, `test_parametric_edits.py`, `test_property_edits.py`), 848 server tests.
+
+**Nov 1, the Edit tool shows what else changes** ([docs/manual-edits.md](../manual-edits.md)). Take joined parts along and Apply to the type show only where they do something (`manual.choices_for` on the picked face; "Apply to type FT-BOX · 1 other"); a check reads as the edit, then a line per thing it brings along (`effects`), then Also changes N other elements by why (`manual.also`, `alsoGroups`) with Show them; a type-wide check says how many it checks. A floating Properties panel closes when the Edit tool opens (`DockHandle.closeFloating`); an editable row's pencil shows muted without a hover. Checked: web tests (228), build; in Chromium on the parametric fixture, F1's top offered only Apply to type FT-BOX · 1 other, its check listed F2 by why, W2's side offered both choices, the floating Properties closed and the pencils showed at 45%.
+
+**Nov 1, triage stops, goes on and reads faster** ([09](09-agent-workflows.md), "Stopping and going on"). Measured first, on Muse Spark (the default on Modal): Northbank's 464 detected clashes are 39 model calls of 6-20 s, so the run is waves of `SIGHTLINE_TRIAGE_WORKERS` calls: 58 s at 8, 23 s at 24 with no rate limit hit; the default is now 24 (`triage.WORKERS`). Revit's IFC export names elements "Family:Type:ElementId", and `_stem` kept the id, so no two Revit elements were ever alike and every clash was its own call: a trailing `:<digits>` is now dropped (`_ELEMENT_ID`). The biggest alike groups are asked first. Stop: `triage_report(stop=…)` cancels the queue, wakes back-offs, closes a streamed call and returns within 0.5 s, calls under way never waited for and their clashes left unread, never `unknown`; `Job.stop()`, no audit after a stop, `done` and `state()` carry `stopped`; `POST /api/reports/{id}/triage/stop` (free), only for whoever started the run (`Job.starter`: their `client_id`, or the link's creator for an agent's run) or the owner, 403 for anyone else following a shared run (owner decision), `can_stop` on the stream's `start` and the state. Going on: an imported report's run that stopped or failed reads is replaced by one seeded with its good readings, asking only the rest (one proposal; ORCA's checks already kept readings per clash); a stopped run is never a donor. The Triage card has Stop, "Stopped: n of m sorted", and "Continue · N left" / "Triage N unread" for every report; Workings says "Triage stopped". Checked: `test_triage.py` (stop within a second, nothing asked after it, Job and route stop, only the starter or the owner may stop, resume asks only the dropped clash, Revit stems, order, 24 workers), 862 server tests (the four failures are on main too: two detection clash points, two PDF tests without GTK on this machine), web tests (236), build; in Chromium on Northbank, Stop landed 0.2 s after the click at 209 of 464, Continue read the other 255 in 15.7 s and kept all 209 readings unchanged.
+
+**Nov 1, smoother curves in the viewer** ([13](13-3d-viewer.md), "Loading"). On Autodesk's Snowdon Towers sample round ducts drew as 12-sided tubes outlined along every facet, and Revit's fittings as shards, worst in X-ray. Two causes: web-ifc's default `CIRCLE_SEGMENTS` (12) and its flat normals (each facet its own). The loader now asks for 24 sides (`ifcLoader.CIRCLE_SEGMENTS`) and makes creased normals (`viewer/normals.ts`: each vertex averages the facets at its point within 40° of its own, by their angle there; a vertex is split only where its triangles need different normals). Kept fixes (`patch.toGeometry`) and fix previews (`addMeshes`, welded by the server, which averaged a box's normals across its corners) get the same normals; outlines and measuring's snap edges use the same 40° (were 25°), so a line is drawn where the shading creases, never round a curve's facets. Measured in Node (web-ifc 0.0.77) at 24 sides: Snowdon's architecture +3% triangles, HVAC and plumbing +16-19%, none parsing slower; its structure 1.0M → 1.6M triangles and about 2 s slower, nearly all 14 rebar sweeps; smoothing about 0.35 µs a triangle, done once per geometry (a type placed many times is smoothed once), +0.1-3% vertices; Northbank +42% triangles (35k → 50k), no split vertices. The landing's two demo pictures recaptured (`capture-demos.cjs`): the cell's safety zone and the trees are round. Checked: `normals.test.mjs` (a 24-sided round radial, caps and rims sharp, 30° smooth and 60° sharp, a welded box split flat, no index, degenerate triangles), `viewer-patch.test.mjs` (a kept box flat, a kept round smooth), web tests, build, docs map; in Chromium on Snowdon HVAC + structure against main on the same clash and camera: the elbow of #2 and the duct of #3 shade smooth with only their rims outlined (main: an outline down every facet), and a push/pull's preview and kept duct draw through the new paths. Found, not fixed: Snowdon lies about 418 km from its origin, where float32 positions step 31 mm, so small elements' vertices are visibly snapped; Northbank is within 15 m and unaffected (drawing relative to a model origin is the fix).
+
+**Nov 1, georeferenced models drawn without snapping** ([13](13-3d-viewer.md), "Coordinates and units"). Snowdon Towers lies about 418 km from its origin (a Revit export in survey coordinates), where a float32 steps 31 mm: every vertex of a 200 mm duct snapped to that grid, its round ends came out square, and Revit's fittings looked like shards (read before as coarse tessellation; it was this). web-ifc's placements carry the offset (local vertices are within 90 m), so the viewer now draws from an origin (`viewer/origin.ts`): the loader takes each placement relative to it in double precision before writing vertices; the first file of a load picks it (the median placement, to the metre, zero within 1 km of zero) and every other file, a replaced file and a kept fix's patch use the same one; `Viewer.load` adopts it only with the models. Every IFC point crosses through it (clash points, server triangles, drawing specs and grids, the Edit tool's faces, picks and snaps, measure's copied ends); heights are never shifted. Checked: `origin.test.mjs` (the median and near-zero rule, round trips, server triangles, the float32 step), `viewer-load.test.mjs` (the second file placed from the first's origin, adopted with the models, never by a superseded load), web tests (240), build; in Chromium on Snowdon HVAC + structure: #2's elbow round with circular rims, #3's duct round end to end before and after a kept push/pull (patched in place, no file fetched), the marker on the crossing, a plan's grids on the columns; the landing's demo pictures recaptured byte-identical (Northbank and the cell unchanged).
+
+**Nov 1, fittings placed right on millimetre and feet models** ([07](07-fixes-and-edits.md)). Proposing a fix on Snowdon Towers (Revit, feet) blanked the 3D view while ORCA tried a route, and clicking an option flew the camera away. The route's bends were the cause, not the viewer: IfcOpenShell's `geometry.edit_object_placement` with `is_si=False` scales the matrix it is given to SI in place, and `edits._new_fitting` passed the segment's frame, shared by every fitting of the run, so each fitting after the first was scaled again (bends at x 127,277, 38,785 and 11,812 m for a duct at 417,607 m: each × 0.3048). The camera framed pieces 400 km apart, and the geometry check passed bends in empty space as "verified". `_new_fitting` now passes a copy. Metre models (Northbank, every fixture) were never affected: their scale is 1, and the fixtures' ducts sit at an identity placement. Checked: `test_route.py` (every piece of a route on the run fixture in metres and millimetres, its ducts placed as Revit places them, failing before the fix with a bend at z ≈ 0 m); the server suite (866 passed; the 5 failures fail on main too: two detection clash points, two PDF tests without GTK, one live-voice test); on Snowdon HVAC in Python, two routes' pieces within the original run's box; in Chromium on Snowdon HVAC + plumbing, #14 proposed again: the sidestep's four bends drawn on the duct round the riser with the view on the clash throughout, and clicking the verified option framed it there (before: the view blanked on a route and an option flew away).
+
+**Nov 1, a chain's pieces must meet** ([07](07-fixes-and-edits.md), "The chain builder"). After #100, nothing still stopped a misplaced piece from being verified: a chain's ports are joined whatever its bodies do, and the clash check passes a fitting left far away because it hits nothing. `_build_chain` now ends with `_check_meets`: each piece's box within `MEET_M` (5 mm) of the next one's, else `Unsupported` ("its new pieces would not meet", ORCA's fault), which the trial undoes, so the idea is never shown. Checked: `test_route.py` (a bend sent 50 m away is refused and leaves nothing behind; it did not raise before), the server suite (867 passed; the failures fail on main too, and the live-voice test passes alone), and in Chromium on Snowdon HVAC + plumbing, #14 proposed twice: both routes drawn as one connected dog-leg round the riser, neither refused.
+
+**Nov 1, adding and removing models: the server** ([docs/add-and-remove-models.md](../add-and-remove-models.md), slice 1
+of the plan). An open scene takes more models and gives one up without being opened again, so its edits, fixes, checks
+and triage readings stay. `IfcScene.add_files` appends files and measures only their boxes (`_measure`, shared with
+`bounds`); `remove_file` drops one file's boxes and moves every later index down (`_edited`, `history`); both bump the
+revision and a new `layout`, and drop what other modules cached from the file list (`scene.FILE_CACHES`).
+`Workspace.add_models` (and `add_samples`) refuses in words STEP among building models or the reverse, a name already
+open, and one scene past the byte budget (opening had no budget refusal: it only evicted older scenes); STEP converts
+through the helper opening now uses too (`_as_ifc`), and each upload's folder joins the scene's (`_roots` is a list).
+`Workspace.remove_model` refuses a stale position (`StaleLayout`, 409) and the only model, deletes an uploaded file
+(never a sample), and takes the model's clashes out of every kept check and what each compares its next run with
+(`checks.Register.drop_file`): the checks stay current, nothing is called resolved, no number is reused. The edit log
+marks an entry that changed the model `model_removed` (`Journal.drop_file`): it stays, is never undone or redone, and
+undo passes over it; the other entries' file indexes move down, so their undo and redo still work. A wider fix's saved
+state holds the old file list, so it is refused once the layout has changed. Routes `POST /api/scenes/{id}/models`
+(samples, free), `POST …/models/upload/stream` (one model upload; mixing and "already open" refused before it is
+charged) and `DELETE …/models/{index}?name=`; every way in, `GET /api/scenes/{id}` and the patch now carry `layout`.
+Found on the way: doc 10 said 64 routes (80 before this, 83 now) and doc 05 said report matches are never dropped
+(they go with their report). Checked: `test_scene_models.py` (27); 895 server tests pass (the four failures fail on
+main too: two detection clash points, two PDF tests without GTK); 240 web tests, build clean; against a server on port
+8023 with Northbank: Structure + MEP 452 clashes, a hand edit kept (E1), Architecture added in 0.6 s, Run all again
+463 clashes in 2.9 s (12 new from #453, every earlier #N kept), Architecture's file served at index 2, the palletising
+cell's STEP refused in words, a stale delete 409, Architecture removed (12 clashes gone, 451 left, the check not
+stale), then Structure removed and the export one `Northbank-MEP.orca.ifc` carrying the edit's `ORCA_Edit`. The page
+and viewer are slice 2 (`feature/add-remove-models-page`).
+
+**Nov 1, adding and removing models: the page and viewer** ([docs/add-and-remove-models.md](../add-and-remove-models.md),
+slice 2). With models open, Menu › Models offers **Add to the open models** (the samples of their kind not open yet,
+and **Upload models to add…**) above **Open instead**. `App.addModels` checks first (`sceneModels.addRefusal`: mixing
+STEP and IFC, a name already open, in the server's words, so nothing is uploaded or charged), then fetches only the new
+files and `Viewer.add`s them at the models' origin, and runs every kept check again. Each model in the Visibility menu
+has a remove button that asks first, naming what goes ("Remove Northbank-Architecture? The 12 clashes with it go
+too."; kept edits add "Export first to keep the edits." and an Export first button); `Viewer.remove` disposes the file
+and moves the later ones and their hidden marks down. Both wait in words while a proposal, plan, triage, check or other
+work runs. A reply on a layout the page doesn't know (another tab, an agent) loads every file again (`reloadModels`),
+including any patch through `applyToViewer`. New `sceneModels.ts`; `api.ts` gets `addModels`, `addModelsStream`,
+`removeModel` (both upload streams now one `streamUpload`). Checked: `scene-models.test.mjs` (8),
+`viewer-load.test.mjs` (+3), 251 web tests, build clean; in Chromium against port 8023: Northbank Structure + MEP 452
+clashes, #1 (the supply main through the transfer girder) proposed and its offset kept (E1); Architecture added: 463
+clashes, its 12 listed, #1 still resolved, the same scene; removed after "Remove Northbank-Architecture? The 12
+clashes with it go too.": 451, E1 kept, the Visibility menu MEP and Structure; the export `Northbank-MEP.orca.ifc`
+carrying `ORCA_Edit`; the palletising cell's STEP refused in words on the page with nothing uploaded; both demo cards
+(464 and 112 clashes), the first three steps of both tours, Architecture added to Structure alone framed with it; and
+a model added through the API behind the page's back, then Ctrl+Z on the page: the page loaded all three files again.
+
+**Nov 1, an isolated clash shows what its fix moves** (`fix/isolate-shows-what-a-fix-moves`). The fittings a move
+carries are the model's own elements shifted by the preview (`Viewer.moved`), so a clash row's Isolate, the Isolate
+and Context modes and the filters hid them while the stretched and tilted segments (server meshes) showed: on Snowdon
+#20 isolated, the tilted drain ended in mid-air without its bend. `Viewer.applyMode` and `drawLinks` now always show
+what a preview moves, as `views.shownBy` already said. After Keep, the clash's isolation adds what the kept edits for
+it changed or made, from the edit log (`App.keptFor`: by clash id, else by pair; an undone entry drops out), and the
+views fly to the clash once, not again when those parts change. Checked: `viewer-filters.test.mjs` (+1),
+`isolate-clash.test.mjs` (+1), 253 web tests, build clean; in Chromium on Snowdon Towers plumbing, with
+`feature/drain-tilt` merged locally: #20 isolated, Muse Spark's "Tip drain down 65 mm at outlet end" (falls 4.4°,
+nearest +25 mm) drew the bend lit as joined in After and Both; kept, the tilted arm, the bend and the shortened stack
+stayed in the isolation ("Now: no overlap here") and the camera stayed; Ctrl+Z, the pair alone again.
+
+**Nov 1, Revit's sanitary pipes are drainage** ([07](07-fixes-and-edits.md), "Route"). On Autodesk's Snowdon Towers sample, Spark and Wonder found no fix for #20 (a cold-water stub through a washer drain), and the drain turned out to be treated as a pressure pipe: Revit's IFC2X3 systems carry no type, and neither "Building Sanitary" nor "Pipe Types:PVC - DWV" matched `edits.GRAVITY_WORDS`, so the drainage rule (a route keeps a drain's fall and never steps it up or down) never applied to Snowdon's 697 sanitary segments. The words now take `sanitary` and `dwv`. Checked: `test_route.py` (Revit's names in a plain IFC2X3 system: a DWV pipe, copper in a sanitary system and a DWV pipe in another system are drainage, a cold-water pipe is not; the three failed before), the server suite.
+
+**Nov 1, a drain tilts instead of breaking its joint** ([docs/connections.md](../connections.md), "A drain tilts"; [07](07-fixes-and-edits.md), "Move"). Snowdon's #20 had no fix: a washer's waste arm runs dead level through a cold-water stub at its own height, 24 mm from its bend over the stack, and each pipe is held at one end by a fixture, so every move was refused, the stub has no room for bends, and a drain may not step up or down. A plumber lowers the stack end and gives the arm the fall it lacked. Now, under re-fits, a drain moved straight up or down turns about the cap that stays (`edits.tilt`, `tilt_fits`, `tilt_room`, `drain_outlet`; `connections.Tilt` in `MovePlan.tilts`): asked to move on its own while a fixture holds one cap, or reached at a cap and joined at its far one, where it is never re-fitted with bends up or down. It must end falling more toward its outlet (from its ports' flow, else away from a fixture), each joint turning at most 5° (`TILT_TURN_MAX_DEG`). It rides the move like a jog (changed, preview, before, key, `edit.tilts`, the summary), is checked as what moves, and stays out of `moved` (`plans._candidate_move` and the requirements' side count it). Muse reads how far a held drain may go. Checked: `test_drain_tilt.py` (Snowdon's knot built in metres and millimetres with Revit's placements: the turn and ports, refusals in words, the plan and its key from the carried bend, trial and joints, up refused as before, a drain jogged only sideways, Muse's text, Muse's move tried, kept through `plans.apply`, valid IFC and undone, a hand move, a tail open at its far end kept from itself), the server suite (898 passed; the 4 failures fail on main too); on Snowdon in Python, the arm dropped 65 mm falls 4.4° and passes at 25.1 mm, 50 mm fails at 21 mm; in Chromium on Snowdon plumbing (with the sanitary-words fix), #20 proposed once: Muse Spark's first idea, "Increase fall of drain A 70mm at clash end", verified (falls 4.7°, 30 mm clear), drawn tilted with the bend carried and the stack shorter, and accepted in place ("no overlap here"). Found: while a clash is isolated, the After view hid the parts a move carries (the bend here), as for every carrying move; fixed in "an isolated clash shows what its fix moves", above. Also found: the page's Accept (`/fix/apply`) refused a tilt that translates nothing (a tail open at its far end, `moved` empty) as naming no element; it now takes one whose edit names a tilt (`test_the_page_keeps_a_tilt_that_translates_nothing`).
+
+**Nov 2, a big model stays quick while ORCA works** ([12](12-web-app.md), "The clash list draws what is on screen"; [13](13-3d-viewer.md), "Frames"). Owner report on Snowdon Towers' architecture (204 MB, 6,604 elements, 2,471 clashes from ORCA's check): moving round the model, clicking a clash while titles were still landing, and an element's Properties were all slow. Measured in Chromium (Intel Arc B580, dev build): the 3D view itself held 60 fps; the page's thread did not. Every row of the list was drawn, so each title batch, each list thumbnail (one every 60 ms) and each click re-rendered 2,471 rows (0.3–0.6 s each); each row's lazy thumbnail kept an intersection check Chromium ran every frame; and the viewer drew every frame with nothing moving. Clicking a clash took 0.9–6 s to answer, Properties 2.5 s, orbiting while thumbnails were drawn 5 fps, and the thread was busy about 5 s of every 8 with nobody touching anything. Now the list draws only the rows on screen (`rowWindow`: each group keeps its height with padding, measured on scroll, resize, toggle and change; the selected clash and the tour's row are scrolled to when not drawn), the viewer draws on demand (`redraw`: every method call but questions and pictures, pointer and wheel over the stage, the controls' moves, for 250 ms after and while anything glides, flies or waits to be drawn), and thumbnails wait while the camera moves (`Viewer.moving`). Checked on the same model, titles landing: a clash click answers in 34–63 ms at the top, 300 and 1,500 rows down; Properties in 94–136 ms; orbiting while thumbnails are queued 58 fps; the thread busy 34 ms of 8 s at rest, no long tasks; the landing page draws no frames; a plan beside the 3D view draws its full picture once a pan rests; the phone layout's sheet scrolls and draws its rows. `viewer-frames.test.mjs` (frames stop, questions and pictures draw none, gliding, a drawing waiting and an async load keep or start them, a disposed viewer never draws) and `clash-list.test.mjs` (the window's rows, a long list's first rows and padding); web tests (259), build.
+
+**Nov 2, models parsed in a worker, an upload while it goes up** ([13](13-3d-viewer.md), "Loading"). Snowdon Towers' architecture (204 MB) held the page about six seconds after the server had opened it: web-ifc's open (1.5 s) and tessellation (2.6 s), creased normals (0.8 s) and placing (0.6 s), all on the page's thread (timed in Node). The parse moved to a worker (`viewer/ifcParse.ts`, run by `viewer/ifcWorker.ts`; `ifcLoader.ts` asks it, builds the batches from the arrays it hands back without copying, and ends it after 15 s idle to give web-ifc's memory back; on the page only if no worker starts), and an upload of IFCs is parsed while it goes up and the server opens it (`Viewer.stage`, used by `Viewer.load` when the server kept the files as sent, else dropped). Checked in Chromium on the same file: shown the moment the server finished, where before it took 5.6 s more behind a 5.3 s freeze; the longest stall during the load 0.4 s. `ifc-parse.test.mjs` (packing, merged placements, the origin, colours, a failed parse closes web-ifc's model, the batches built from a parse) and `viewer-load.test.mjs` (an early staging shown without parsing again, superseded or unused staging disposed); web tests, build.
+
+**Nov 2, a check on a Revit model in 17 s, not 150** ([06](06-geometry-and-detection.md), "Narrow phase and depth"). ORCA's check of Snowdon Towers' architecture (204 MB, 6,604 elements) spent 148 of about 150 s building its triangle tree: OpenCASCADE sews each of Revit's faceted meshes into a solid first, 580 of the 613 CPU-seconds of triangulating (timed per element across 32 processes; no OpenCASCADE setting helped). Every clash query (detection's tree, the live measure, a fix's check) now triangulates an element whose body is only `IfcFacetedBrep` or `IfcFaceBasedSurfaceModel` (through mapped items, no openings) with the mesh kernel (`scene.faceted`, `scene.kernel`), so all three agree. The check takes 17 s and finds 2,453 clashes instead of 2,471: the kernels close Revit's meshes differently. Judged independently from the triangles (overlap volumes of the closed pieces, manifold3d) on 26 of the 61 disputed pairs, OpenCASCADE was nearer in 18, the mesh kernel in 8, and the mesh kernel misses about 20 recessed lamps set into ceilings; the owner chose the speed. Northbank and the cell have none of these elements (checked: no element of theirs is faceted), so they triangulate exactly as before. `test_faceted_kernel.py` (which elements count, through mapped items, never with openings or triangle meshes; detection, the live measure and a fix's check see the same faceted overlap, each through the mesh kernel); server tests (928 pass; the 4 that fail fail the same on main: two clash-point locations in `test_detect.py`, two PDF tests without GTK here); Northbank's four models checked with the rule and without: the same 464 clashes, the answer key on the girder 3/3 (#042 −300, #057 −100, #061 −77 mm).
+
+**Nov 2, the dev server ignores its virtual environment** (README, "Start both servers"). Owner report: while working, the open models vanished and every call answered 404; the Python terminal showed `WatchFiles detected changes in '.venv\Lib\site-packages\isodate\version.py'. Reloading...`. With plain `--reload` uvicorn watches the folder it runs in, `server/`, which holds `.venv`; its default `.*` exclude matches file names, never parent folders, so a package install or re-sync there (another session's `uv run`, no dependency change) restarted the server and dropped every scene, report and kept fix. The local command (README, `app.py`, [10](10-http-api-and-streams.md), [18](18-testing-and-evals.md)) now adds `--reload-dir sightline`, and the README's troubleshooting names the symptom. Checked with the server's uvicorn 0.54 in a throwaway folder laid out like `server/`: without the flag, rewriting a file in `.venv` restarted it with the same warning; with it, the same write did nothing and a change to the package's code still restarted it.
+
+**Nov 2, openings through Revit's faceted walls** ([07](07-fixes-and-edits.md), "Penetrations"). Owner report on Snowdon Towers plumbing and structure: #1, a copper cold-water pipe through `Basic Wall:Concrete 24":601472` (-610 mm), got no fix in three rounds, and Muse Spark's first idea, an opening, was refused at once: "only a host whose body is extrusions can be cut here". Revit writes that wall as an `IfcFacetedBrep` (12 of the structural model's 58 walls; 11 of its 108 slabs are a faceted B-rep or booleans, refused the same way), and `edits.not_penetrable` took extrusions only, a cautious rule from the first penetrations (Oct 29) with no failure behind it; it also kept the opening's size out of Muse's brief. Nothing else needs extrusions: the opening is sized by rays against the host's triangles, `feature.add_feature` voids any body, the kernel rule sends a host with an opening to OpenCASCADE (`scene.faceted` reads `HasOpenings` each time), and the check after the cut proves it. Now a host needs only a body the kernel can triangulate, and one it cannot is refused in words (`_host_tris` raised `RuntimeError` past `_try_penetration` before). Checked: `test_penetration.py` (a wall rewritten as a faceted B-rep takes the same Ø170 mm opening as the extruded one, Muse is told of it, the agent's try passes and the cut clears the pipe; a host the kernel cannot read is refused in words; both failed before); on Snowdon in Python, ORCA's check (1,279 clashes, 17 s) and #1's opening as the agent tries it: refused before; now a Ø220 mm opening, 32 mm clear, verified in 0.5 s, the wall's mesh cut (18 to 82 vertices) and no hit on the wall.
+
+**Nov 2, the landing plays a fix, not a still** ([19](19-demo-data.md), "Landing clips"; [18](18-testing-and-evals.md)). Owner request: the demo cards showed stills of each scene; show clashes with a proposal implemented, and Workings. The README's clips show the whole app, too small at a card's width (about 500 px). `capture-proposals.cjs --landing` records a live proposal with the left and bottom bars collapsed in a 1110 × 435 window at twice the pixels and keeps only the 3D view (the rail cropped off), so the clash chip, the "Fixing #N" pill, the ideas tried and the Before / After numbers read on the card; Workings is recorded alone at 720 × 540. Three things found on the way: the screencast sends frames at CSS size whatever the pixel ratio (frames are now screenshots of the kept part, `Page.captureScreenshot` at scale 2); Playwright reaching the rail's "Go to the clash" scrolled the short stage and left the frames white below (the F key now); the clash list draws only rows on screen, so #66 is found through its filter. Under SwiftShader Northbank's run drew about one frame a second while the server checked ideas and the tries were lost; `--gpu` (Direct3D, Arc B580) gave 9 a second throughout. `--keep` and `--from` encode a kept run again without a new proposal; the landing's pace runs the wait at 6×, its last 5 s at 2×, Workings' round at 10× and its checks at 0.5×. The cards (`DemoCard` → `Clip` in About.tsx) play `fix-northbank.webp` (#1: idea 1 tried, the 400 mm offset through the web opening verified, the drop under the girder hitting a ceiling; Before / After, 17 s, 2.2 MB) and `fix-cell.webp` (#66: two offsets under the rails verified; 16.7 s, 1.2 MB); "What ORCA does" sets its steps beside `workings.webp` (12.3 s, 0.9 MB). Each has a `-still.webp` of its last frame, served through `<picture>` to people who ask for less motion. Animated WebP at quality 65: at 1:1 its text matched quality 80 and 90, which weighed 3.1 and 5.0 MB. Checked: web build, 263 web tests, `test_docs_map.py`; in Chromium against the built app, the three clips load and change over 2.5 s, with reduced motion the three stills load and nothing moves, cards 498 px wide, Workings 545 px beside the steps and below them on a phone.
+
+**Nov 2, a take script for the demo video** ([12](12-web-app.md), "Build, assets and tests"; [docs/demo-video.md](../demo-video.md), "Recording the takes"). Owner decision: record the video's shots with Recordly, a desktop screen recorder that draws the cursor from a script's clicks and zooms on each, one take per shot so any shot can be taken again alone. `web/scripts/record-demo.cjs` drives ORCA in Chrome's app mode at a 1440 × 900 page with a profile outside git (`--login` signs the owner in once) and starts and stops each take over Recordly's local control server. Recordly is AGPL-3.0 and stays in its own checkout: the script loads its Playwright helper and Playwright from there (`--recordly`, `RECORDLY_DIR`, else `../Recordly`) and nothing of it is in this repository (BUILT_DURING_HACKATHON.md). Nine shots from the script (`open`, with `--filters` the proposed beats; `triage`; `duct`; `built`; `accept`; `revision`, Rev04 from the camera the duct take ended on, kept as a saved view with a section box round #1; `cell-29`; `cell-13`; `voice`), each an unrecorded setup and a take; a take that fails is still stopped and its footage kept, then the next shot runs. Found on the way: a clash row's own buttons cover the middle of the row once the mouse is over it, so the script clicks its #N; a row in a closed group, or not drawn yet, is opened or filtered to, never a group toggled shut; the dock keeps its last tabs, so the Clash tab is brought forward before a clash shot. Checked: `record-demo.test.mjs` (6: arguments, order, a missing checkout, the window-title fallback, a failed take detached then stopped), 269 web tests, web build, `test_docs_map.py`; `--dry-run --headless` against a local server with no model keys: `open` (464 listed, X-ray) and `open --filters` (four discipline colours, then MEP and Structure framed by themselves, the key naming the two), `revision` (461 clashes with Rev04, the saved camera and box), `cell-13` and `voice` to their end, and `duct`, `cell-29`, `triage` and `accept` to the model calls they need; the live app's start page read once, headless (its title, both demo buttons). No take was recorded yet: the owner records them on Nov 3. After review (Nov 2): the opening's filter beats are agreed and run by default, then X-ray (owner; `--no-filters`, `--no-xray` leave them out; `--filters` still runs). Colour by… is reached with the cursor and set without a click, since Chrome's own drop-down is a window of its own that a window recording doesn't capture. Ctrl+C is the script's (Playwright's own handler off): it stops the take recording, or the one still starting once it has, keeping the footage, then closes Chrome. A shot that ran but shows the wrong thing is a RETAKE in the summary, with why, and the run exits 1. Each shot first asks Recordly whether a take is still recording and fails at once if so. The start page waits up to 180 s (a cold start on Modal). `cell-29` starts on #29's row; Report and Build get a zoom each; clash shots choose Workings in Activity (turned on if off); the opening now ends on Filters, which the dock keeps in front, so the clash list's tab is brought forward wherever the list is awaited. The Recordly helper now finds the app window's page itself (`openAppPage`), so none of its code is restated here. The sign-in line names the owner setting as Owner settings does, "Show it built (Muse Image)", and the `built` shot checks it before recording. Checked: `record-demo.test.mjs` (10), 273 web tests, web build, `test_docs_map.py`; `--dry-run --headless --only open,triage,cell-29,cell-13` against a local server with no model keys.
+
+**Nov 2, a recorded run beside each step** ([19](19-demo-data.md), "Landing clips"; [18](18-testing-and-evals.md)). Owner feedback on the landing: the one Workings clip beside "What ORCA does" covered steps 1 and 2 and left the space beside 3 and 4 empty; the owner chose a clip per step. Each step (`Step` in About.tsx) is now a row, its words beside its clip and a line under it: 1 `check.webp` (Northbank's check listing every pair of models, then the list: 464 clashes, numbered, being named; 11.0 s, 0.7 MB), 2 `understand.webp` (the Clash panel while Muse Spark reads #1: the three pictures, its reasoning, its understanding of the clash; 14.0 s, 0.6 MB), 3 `workings.webp` (11.5 s, 0.8 MB) and 4 `keep.webp` (Before / After, Accept, "Fix kept in the model … checked again", Export IFC counting one edit; 9.9 s, 0.2 MB). `capture-proposals.cjs --landing` now captures the whole window and each clip crops its part, so one proposal on #1 gives the card (re-recorded: 15.4 s, 1.9 MB) and steps 2-4, the run keeping the fix after Before / After; step 1 is a run that only opens and checks. Found on the way: the check starts while the loading card is still up (the clip starts once the models are drawn); a panel scrolled once to the reasoning stops at its end and the reasoning arrived below a 4:3 crop (the panel is kept on it every second and the crop is all of it, near square, its figure narrowed to 430 px high); the panel is words throughout, so its clip has no speed badge and its caption says it is sped up. Clips are described in their alt text from this run. Checked: web build, 263 web tests, `test_docs_map.py`; in Chromium against the built app, the six clips load and change over 2.5 s, with reduced motion the six stills load and nothing moves, step clips 535 px wide (the panel 414) beside their steps at 1440 px, each under its step on a phone.
+
+**Nov 2, the steps as tabs beside one player** ([19](19-demo-data.md), "Landing clips"; [12](12-web-app.md)). Owner feedback on the clip beside each step: "good content, but the layout is poor" (small cards stranded in white space beside clips of four shapes, about 1,650 px tall); the owner chose tabs beside one player. `StepsPlayer` (About.tsx) lists the four steps as tabs (the active one shows its words and a bar for the time left) beside one 16:10 frame playing the chosen step's clip, a clip of another shape on a dotted ground; it moves on when a clip has played through and stops moving on once the visitor picks a step (a click or the arrow keys). `stepClips.ts` reads an animated WebP's length from its frames (`webpDuration`) and fetches each clip once (`loadClip`); each plays from a fresh object URL of those bytes, so it starts from its first frame whenever its step comes round, with no second download. Nothing is fetched before the section scrolls into view (then the clip on screen and the next); less motion shows the stills and does not move on. Step 1's clip re-cropped to 16:10 from its kept frames. Two layout slips found in Chromium and fixed: `.about p` reset the words' inset, and a squarer clip filled the frame's width and was cut (the picture now fills the frame absolutely, `object-fit: contain`). Checked: `step-clips.test.mjs` (4: lengths added up, odd-sized chunks padded, stills and other files have none, `keep.webp` as encoded), 267 web tests, web build, `test_docs_map.py`; in Chromium at 1440 px the section is 400 px high (was 1,650), no animated clip fetched before it is in view, step 1 moved on after 10.9 s (its clip 11.0 s), a click on step 4 stayed 12 s with no time bar, ArrowUp moves and focuses, ArrowDown wraps round, less motion shows the still and stays; on a phone the tabs stack above the frame.
+
+**Nov 2, the take script after the owner tested it** ([12](12-web-app.md), "Build, assets and tests"; [docs/demo-video.md](../demo-video.md), "Recording the takes"). Owner feedback on the first takes: the cell's beat is #22 (PC-03's air branch PL-302 through a plant column) with its fix asked for in Chat, in place of #29; `duct` and the cell switch to four views on camera; Workings stays where it lives, docked along the bottom at its full height, never floated; the window is maximized. `cell-29` is gone; `cell-22` starts on #22 in 3D only, switches to Four views (the Views menu, then Four views: one zoom), picks #22, then types "Find a fix for clash #22." into Chat and sends it: Muse Spark runs ORCA's fix agent through its `propose_fixes` tool, the page selects the clash and shows the run's verified options, and the take ends on them in the Clash panel; it is a RETAKE when the chat doesn't run the fix agent on #22 or verifies nothing (read from the steps under the answer and the options on the page). `duct` switches to Four views once #1 is picked, so the proposal and Before / After play in all four. Every setup puts the viewer back on 3D only (kept in the browser) and docks Activity in its bar (Put it back, the bar opened) showing Workings at `WORKINGS_HEIGHT`: ORCA's own fit when the bar is short (Workings chosen again), a drag of the bar's top edge when it was sized taller by hand; the opening, which starts on the start page, reads what the browser keeps and puts it right in Northbank first. The duct take's camera is saved after the take in 3D only (in Four views the 3D tools fold into a menu). The window is maximized with Recordly's `maximizeWindow` and the page size printed; the 1440 × 900 page is gone (headless dry runs use 1920 × 1080). Checked: `record-demo.test.mjs` (15), 282 web tests, web build, `test_docs_map.py`; `--dry-run --headless` against a local server with no model keys: `open`, `triage`, `duct`, `revision`, `cell-22`, `cell-13`, `voice` to their ends (the AI steps to their refusals: `cell-22` reached Chat's answer and was a RETAKE, as with no key it must be), the opening's tidy pass on a fresh profile (the bar 120 → 380 px by ORCA's own fit) and on one with Activity floated, Four views kept and Steps chosen, and `duct` on one with a 300 px bar collapsed (opened, dragged to 380 px). No take was recorded. After review (Nov 2, once the controller had recorded `duct` and `cell-22` live, both ok): the chat's verified options are counted once the page has landed the run, since ORCA plays the ideas it tried in the viewer after the chat's turn ends and draws no option until then ("Working…" gone, then 1.5 s; while the chat says it verified some and none is drawn, up to 60 s); Chat's line is typed only into its focused box and checked there before Send, so no key reaches ORCA's single-key shortcuts, and a Send that adds no turn fails within 5 s (the voice take too); an inside-a-take layout switch that finds the viewer already there says so. Checked: `record-demo.test.mjs` (17, two with fake pages for these), `--dry-run --headless --only cell-22,voice` against a local server with no model keys.
+
+**Nov 2, the landing says what a missed clash costs** ([12](12-web-app.md), `About.tsx`; [18](18-testing-and-evals.md), "Numbers people see"). Owner request: put a sourced figure beside "missed, it costs rework on site". The landing and About ORCA's overview now say avoidable errors cost about 5% of a project's value directly and an estimated 10 to 25% with indirect costs, linked to the Get It Right Initiative's *Strategy for Change* (`GIRI_STRATEGY` in `About.tsx`; its wording checked on that page Nov 2: "in the order of 5% of project value", "between 10% and 25% of project cost"). It is the industry's number, not ORCA's: the rule for numbers people see now covers both kinds. Rejected as sources: vendor per-clash costs ("$5,000 a clash", "5–50× on site") with no primary study behind them. Checked: `npm run build` clean, 284 web tests, `test_docs_map.py`; both pages in Chromium at 1280 and 390 px (link opens a new tab, no sideways scroll, no page errors).
+
+**Nov 2, the live demo stays warm; the README names its user and what's next** ([17](17-deployment-and-operations.md), "The container"; [20](20-decisions-limits-and-roadmap.md); [docs/submission.md](../submission.md)). Read against a scouting report on past Meta hackathons: the Startup track asks whether a project holds up in production, and a judge arriving after 20 quiet minutes met a cold start with no models open. Owner decision: `deploy/modal_app.py` keeps its one container warm (`min_containers=1`) through judging, about $3 a day at Modal's list prices (2 cores and 4 GiB billed all day), then 0 again. Past winners named their user in one line and showed a next step: the README now opens with the user, the design coordinator "who makes every team's 3D design fit together, on a building or a machine", in plain words for any industry ("where two designs conflict"; "clash" only once explained, owner feedback), and gains "Who it's for" (the coordinator first, then the teams whose models meet, whoever sets the standard, people who don't read drawings and teams with their own agent, each with what ORCA gives them; the table in [01](01-product-and-journeys.md)) and "What's next" (connectors into design tools, site data with SAM 3.1, saved projects, from 20's "Later"). `docs/submission.md` drafts the submission's one-liner and what's next, and the video's last shot gets a proposed what's-next line ([docs/demo-video.md](../demo-video.md), 2:50), both for the owner. Checked: `test_docs_map.py`; Modal 1.6.3's `App.function` takes `min_containers`; the warm container takes effect at the next `modal deploy`.
+
+**Nov 2, the live demo deployed warm, and Show it built on for everyone** ([17](17-deployment-and-operations.md); [16](16-security-caps-and-cost.md), "Show it built's budget"; [20](20-decisions-limits-and-roadmap.md)). PR #118 deployed from `main` (`0b263aa`) from the cloud session: a container started with no request (`min_containers=1`); Northbank 464 clashes in 5.0 s with #1 the duct through the girder; Muse Spark's first idea on #1 verified in 42 s ("Offset main up 400 mm through girder opening"); streams `identity` under a browser's `Accept-Encoding`; the cell's 112 clashes numbered exactly as before the deploy (#13, #22 and #29 unchanged for the takes). This checkout had no `samples/step-cache`, so the cell's first opening converted again (38.6 s; 56.4 s after the restart below) and was done by hand so visitors find it cached. Owner decision: Show it built on for everyone through judging. The owner token is not in the cloud session, so `built_views` was set to true in the Modal Dict with the Modal SDK (it was false; every other setting kept) and the container restarted (`modal container stop`), since settings are read once per process: `/api/models` then said `built_views: true` for a visitor, and a non-picture sent to `built/stream` was refused 422 after the switch (not 403), with no model call and no cap taken.
+
+**Nov 3, what's next in the video's last shot, and a new opening told as O·R·C·A** ([docs/demo-video.md](../demo-video.md), "Script" and "Production notes"; [12](12-web-app.md), "Build, assets and tests"). Owner decisions. The proposed what's-next line goes in, and the owner wrote a new opening (teams' 3D models; "Individually, everything works. But bring those designs together, and problems emerge."; clashes, and the later they're found the more they cost). Bridge: "We've sat in the meetings where teams spend days finding them, and longer arguing about who moves. So we built ORCA." ORCA's name is the order of the story: each beat opens with its verb (Observe now carries triage, Muse Spark Open finding the five that need a fix among 464, "most are noise"; then Resolve, Check, Apply), and the close answers the opening ("Now, together, it does."). At the old pace (393 words in 2:55) the new script ran about 3:11; trimming other beats ("You can watch it work", the cell's and Show it built's wording) brings it to 397 words, about 2:57, with the opening whole. The closing shot and the chips are put together in the edit, where a text layer would fall back from IBM Plex Sans (rarely on Windows), so `web/scripts/video-cards.cjs` draws them as the app would: Plex from Google Fonts on white cards with the notch's 14 px corners, transparent PNGs at twice the pixels in `docs/media/video/` (`next-line.png` 1504 × 254, four `chip-*.png`); it saves nothing if Plex did not load. The Reveal on "So we built ORCA" is the brand kit's `reveal-white.png`. Checked: the pictures (Plex, transparent corners), the card composited under the notch on the last frame of the README's #1 capture, `test_docs_map.py`, `npm test`.
+**Nov 3, the golden path reads its clash close up, and the list's thumbnails fill while ORCA works** ([13](13-3d-viewer.md), "Flights" and "Performance notes"; [12](12-web-app.md)). Owner report: "Watch ORCA fix a clash" read the clash with the 3D view zoomed out on the whole site (the drawing views were on the clash), and the list's thumbnails stayed empty until the proposal was done. The zoom: the check picks the clash and the camera flies in (650 ms), and the proposal starts a moment later; `Viewer.orbit` glided sideways from where the camera was, the whole model, and that glide replaced the flight. It now counts from where a flight under way lands, so the flight finishes and the turn is round the clash framed (the same for a row's Propose fixes and the tour). The thumbnails: `App` paused them while a proposal, plan or replay ran, and `Viewer.moving` counted the pilot's slow turn as a move, so they waited it out. Now they pause only while models load or a check runs, the slow turn is not a move (any move of the user's ends it), and `posed` lifts any preview on screen (the trial's moves and hides, its pieces and what it hit), so a thumbnail, or an A/B/C picture, drawn while ORCA works shows the clash as found. Checked: in Chromium on the built app, the golden path with the page's clock slowed 5× (software GL draws a frame in about half a second, so the flight otherwise ended before the proposal started): before, #1 centred with the whole site in view 6 s into reading; after, framed on the duct and girder from 1 s. Thumbnails at normal speed: before, 0 of 25 rows drawn through the run; after, 3 at 1 s into the proposal, 8 at 3 s, 12 at 6 s, every row on screen by the end, none showing the idea being tried. The A/B/C pictures saved for #1 are the same before and after (mean brightness 215.2, 180.7, 214.9). The proposal: offset +400 mm, 50 mm clear. `npm test` 288 (four new: the turn during a flight, the turn and `moving`, a preview kept out of pictures), `npm run build`, `test_docs_map.py`.
+
+**Nov 3, a picture framed where the pair is in the model** ([13](13-3d-viewer.md), "`posed`"). A follow-up to the entry above, found checking the deploy: `posed` drew the model without the preview, but measured the pair with it (`boxOf` applies previewed moves), so a thumbnail drawn while ORCA tried a move of one of its elements was framed where the trial had put it. It now measures with the moves lifted too. Checked: a test that fails without it (`viewer-links.test.mjs`), `npm test` 289, `npm run build`, `test_docs_map.py`. Also measured on the deploy check: on software GL each thumbnail costs two full renders and the damping glide after the pilot's turn lasts tens of seconds, so the list fills over about 80 s there; on a GPU these are milliseconds.
+
+**Nov 3, the README opens with the logo, a hook and badges** (README, header and "At a glance"). Owner request: a
+header like other hackathon entries, with logos. The README now opens with the brand kit's "ORCA by IssueLab" lockup
+(white in dark mode, navy in light, `assets/brand/orca/png/lockups/`), the hook "Fixes, not just findings. Every fix
+proven before you see it." (owner's pick of the drafts, now in [docs/submission.md](../submission.md), "The hook"), and shields.io badges with Simple Icons logos (Meta, Modal, React,
+three.js, FastAPI, Python, pytest, Node.js) and one with ORCA's own split-O symbol, each linking to its doc. Under the
+existing opening: "At a glance" (six points, numbers from "Two demos") and "Meta models at work" (the five models from
+[08](08-ai-models-prompts-and-spend.md)). The test badges carry a measured run: 934 server tests, 289 web tests (after #123), web
+build clean (Nov 3, this branch); the Tests section says to change them only from a new run. Checked: the header
+rendered in light and dark in Chromium with GitHub's markdown styles; `test_docs_map.py` passes.
+
+**Nov 3, Show it built's picture, laid out again, and dragged on itself** ([docs/show-it-built.md](../show-it-built.md), "Page"; [12](12-web-app.md)). Owner report with a screenshot: the section was messy. In the Clash panel the tools row was wider than the panel, so the check's ⓘ wrapped onto a line of its own and "ORCA's view" broke over two; the label's icon sat alone above its sentence (a wrapping flex row); and the slider's ends read the opposite way to the picture (the illustration is left of the wipe). Then the owner asked for the wipe to be dragged on the picture itself. Now the picture is the control: a press or drag on it moves the wipe, a round handle on the wipe says so, each side is named in its top corner and the name cut at the wipe with its picture, and it starts at half and half. A finger moves it only once it moves, and a swipe the browser takes as a scroll puts it back (`touch-action: pan-y`); the focused picture takes the arrow, Page and Home/End keys (`role="slider"`, its value in words). Under it, **Lines from the model** and a "Checked against the model" chip (the outline match and the judges' verdicts in its tip, as the ⓘ had them); the label is one block beside its icon. The picture being drawn has the same square frame, so nothing jumps when it lands. `record-demo.cjs` finds the wipe by its new name. Checked in Chromium on the real component and CSS at 300, 380 and 520 px against `main`'s (no icon or label apart from what it labels; at 300 px the button and the chip take a row each); a mouse drag from 50% to 80%, a click at 20%, a drag past the edge (0%), the keys (6 × → 30%, End 100%, Page Down 80%), and real touchscreen drags (Chrome's touch emulation) moving it both ways; a vertical swipe scrolling the panel could not be checked here (headless Chrome scrolls on no touch gesture, even on a plain page). `built-view.test.mjs` (4, new), `npm test`, `npm run build`, `test_docs_map.py`.
+
+**Nov 4, a new landing that shows ORCA working** ([01](01-product-and-journeys.md), [12](12-web-app.md), [19](19-demo-data.md), [20](20-decisions-limits-and-roadmap.md)). Owner request: replace the landing's "hackathony feel" with one that "fully conveys what ORCA is capable of end to end", with free rein. `About.tsx` keeps its props and exports (App and the test stubs are unchanged) and is now a page of its own, built from `web/src/landing/` with its own stylesheet; 124 lines of the old landing's CSS left `index.css`, the shared rules stayed. **The hero** is a live three.js replay (`Hero.tsx`, `heroScene.ts`, `timeline.ts`) of Northbank's answer key, drawn from the models' own geometry, read with IfcOpenShell into `northbank.ts`: the girder `TB-L02-01` with its 20 mm web and six openings, the duct, tray and cold water main, and their neighbours. In 36 s it sweeps the check, pins #1 to #3 at the list's depths (-300, -100, -77 mm), grows each idea out of its run in amber (a shader lift), checks it, turns it teal with the room left, keeps it and counts Export; the tray's whole move fails first on the return-air spigots it really crosses (magenta), as CLAUDE.md's Oct 27 finding says whole moves do; the finale is "3 of 3 at the designer's own heights". Phase row, log, chapters, pause, drag to look round; everything past an ellipse fades in the shaders; the scene is framed in the HUD's empty window wherever the layout puts it; it pauses off screen, gives a still for less motion and a recorded still without WebGL. **Try the check yourself** (`check.ts`, `Sandbox.tsx`) cuts the check to the plane that decides #1: drag the duct and it says clash gone, anything new hit and the room left; +400 mm gives the recorded 50 mm all round, and only +375 to +425 mm passes at 25 mm (+400 mm alone at 50 mm). The rest: the problem (sheets of the three teams' models meeting until their clashes light), the loop as tabs beside one frame playing each step's recorded run (the Nov 2 decision kept: one screen high), the seven kinds of fix and combined in pictures, "The model proposes. Geometry decides." with the five models, everything around the fix, the two demo cards (the same clips and numbers), who it is for, what is proven and what is not yet, words and colours, the close, and a header whose links follow the scroll. Every number on it is one already measured (README, About ORCA). Two traps met: `container-type` makes no stacking context, so the page's sticky header covered the app's corner until `.lp-page` was isolated; and a context given back with `forceContextLoss` stays lost on its canvas, so StrictMode's second mount needs a fresh canvas. Checked: `landing.test.mjs` (19, new: the replay's order and its numbers, the check's numbers against the recorded fix, the sweep and offsets, each run clearing its own opening by the recorded amount), `npm test` 313 (after the check below), `npm run build`, the server suite (934, unchanged code), `test_docs_map.py`; in Chromium (SwiftShader) at 1440×900, 1280×800, 1024×768 and 390×844 and with reduced motion: the replay through all its chapters, the check driven by drag, slider and keys (as modelled not verified, +400 mm verified at 25 and 50 mm, +420 mm too close at 50, +850 mm the slab), the guided tour finding its button, **Watch ORCA fix a clash** opening Northbank and proposing on #1, **Use your own models** and back; no console errors. The landing adds about 33 KB gzipped of script and 10 KB of CSS.
+
+**Nov 4, the landing checked against ORCA itself** ([01](01-product-and-journeys.md), [19](19-demo-data.md)). Owner: "ensure you understand what ORCA does". Every claim on the new landing was read against the code and the design docs, and the replay's beats against ORCA's own records. Corrected: Muse Spark is told an opening's heights and the rise that clears it (`agent.py` from `edits.passages`: +0.375 to +0.425 m at 25 mm), not its size, so the replay says that (and the hands-on check's passing band is the same, now a test); the tray's beat follows the recorded root-cause plan (`girder-plan.json`: one round, the whole lift failed and the offset passed), not a first idea sent back, and its hits are the ones `verify.check` reports (a return spigot and Core wall E - Level 02); drawing views are up to four at once including the 3D; the cap is the live demo's, on proposals; Muse Wonder is offered (a button by default), not automatic; only move, offset, trim, route and opening are claimed verified on the demos (resize on a test model), as About ORCA says; a PDF per team is an option. Added what the page left out: joints among what "verified" means (a fix keeps every joint or is refused, `docs/connections.md`), and "the rest of the toolkit" (a wider fix, patterns, kept checks, filters and checks on them, properties, joints, adding or removing a model, panels, tours, resume), each worded from its design doc. Checked: `landing.test.mjs` (20), `npm test`, `npm run build`, `test_docs_map.py`, the page in Chromium.
+
+**Nov 4, the hero without its phase row** ([12](12-web-app.md), [20](20-decisions-limits-and-roadmap.md)). Owner feedback on the deployed landing: the row of Observe, Resolve, Check and Apply pills over the replay, with its Export IFC count, looked clickable and was not, and the hero is cleaner without it. Both went (`Hero.tsx`, their styles), with what only fed them (`timeline.PHASES`, the frame's `exports`); the log's tags still say each step, and the scene now has the right column to itself. Checked: `landing.test.mjs` 20, `npm test`, `npm run build`, `test_docs_map.py`; the hero in Chromium at 1440×900 and 390×844.
+
+**Nov 4, the formats' logos and the Navisworks tile's picture** ([12](12-web-app.md), [18](18-testing-and-evals.md), [20](20-decisions-limits-and-roadmap.md), [docs/brand-assets.md](../brand-assets.md)). Owner feedback on the deployed landing: "the navisworks card has nothing in there", and "use these logos at the relevant locations" with the IFC, BCF, Navisworks and MCP logos supplied ("you can generate something for STEP, PDF"). The tile now shows a Navisworks report coming in (its XML and pictures; each clash keeps its own name, gets ORCA's #N and a verdict: `NavisArt`). The logos (trimmed, 192 px, in `web/public/logos/`; STEP drawn as a staircase block, PDF as a folded page) go in a strip under the hero saying which way each goes (`Formats`, lines in `landing/logos.ts`), on the hand-off tile's files, as the agent tile's icon, and beside IFC, STEP and BCF in the glossary; the footer says whose they are and that ORCA is not affiliated with them, and `BUILT_DURING_HACKATHON.md` lists them as not built here. The text-only tile style went with its last user. Checked: `landing.test.mjs` 21 (every logo a file), `npm test` 314, `npm run build`, server suite 934 with `test_docs_map.py`; in Chromium at 1440, 900 and 390 px wide, no console errors.
+
+**Nov 5, the README's local setup checked from a fresh clone** ([README](../../README.md#run-locally)). Followed "Run locally" exactly on Linux, from a new clone: uv sync, `npm ci` (with the viewer's WASM copied), `.env` from the template, both servers, `/api/samples` through Vite's proxy, and step 4 in Chromium (-0.80 Clear · nearest +50 mm, -0.40 hits the pipe). Fixed what a newcomer would trip on: the **Models** list is in **Menu** at every width, not only on small screens; the four Northbank files are ticked by default and must be unticked; opening does not check, so step 4 now names **Check 3 elements** and picking clash #1 from the list (double-clicking stays as the alternative). The stale "before submission" notes now say what was tried where, and the placeholder for a Meta key link is gone: the reader brings their own Meta API key. Checked on the fresh clone: server suite 934, `npm run build`, `npm test` 314, `weasyprint --info`, the local MCP server's `initialize`, every relative link in the README.
+
+**Nov 11, 3rd place, and the repo renamed for it** ([21](21-glossary-and-naming.md), "The GitHub repo"). ORCA won 3rd place in the Startup track (announced Nov 9). Owner decisions: the org is now `IssueLab-Limited` and the repo `IssueLab-Limited/ORCA-hackathon-2026` (GitHub redirects `IssueLab-Inc/ORCA`, `IssueLab-Limited/ORCA` and `IssueLab-Inc/clashwise-sightline` to it, checked with curl: 301; no new repo in the org may take an old name), and the result is said in the repo's description, a line under the README's hook and its first badge, a pill above the landing's eyebrow (`Hero.tsx`, `.lp-award`), the landing's footer (with "not otherwise affiliated with or endorsed by Meta") and About ORCA's footer and "Built during the event". The landing's source link and the README's clone line use the new address. History untouched.

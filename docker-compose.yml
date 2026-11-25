@@ -1,0 +1,42 @@
+services:
+  orca:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # The public origin of this instance (MCP clients display it).
+      - SIGHTLINE_PUBLIC_URL=https://orca.arifin.uk
+      # Demo caps, mirroring deploy/modal_app.py. 0 further down = off/no limit.
+      - SIGHTLINE_PROPOSE_PER_HOUR=20
+      - SIGHTLINE_PROPOSE_PER_DAY=300
+      - SIGHTLINE_ESCALATE_PER_HOUR=3
+      - SIGHTLINE_ESCALATE_PER_DAY=30
+      - SIGHTLINE_WONDER_MAX_USD_DAY=25
+      - SIGHTLINE_BUILT_VIEWS=0
+      - SIGHTLINE_BUILT_PER_HOUR=6
+      - SIGHTLINE_BUILT_PER_DAY=60
+      - SIGHTLINE_CHAT_PER_HOUR=40
+      - SIGHTLINE_CHAT_PER_DAY=1500
+      - SIGHTLINE_VOICE_PER_HOUR=60
+      - SIGHTLINE_VOICE_PER_DAY=2000
+      - SIGHTLINE_MAX_SCENES=8
+      - SIGHTLINE_MAX_REPORTS=8
+      - SIGHTLINE_UPLOAD_MAX_MB=150
+      - SIGHTLINE_MODEL_UPLOAD_MAX_MB=150
+      - SIGHTLINE_SCENE_BUDGET_MB=300
+      - SIGHTLINE_MODEL_UPLOADS_PER_HOUR=10
+      - SIGHTLINE_MODEL_UPLOADS_PER_DAY=200
+      - SIGHTLINE_LINKS_PER_HOUR=10
+      - SIGHTLINE_LINKS_PER_DAY=500
+      - SIGHTLINE_AGENT_CALLS_PER_HOUR=600
+      - SIGHTLINE_OPEN_WEIGHTS=0
+      # Behind the Cloudflare tunnel + Coolify proxy, the visitor's address
+      # arrives in X-Forwarded-For (Modal sets 0 because its edge differs).
+      - SIGHTLINE_TRUST_FORWARDED=1
+      # AI features (proposals, chat, escalation) use an OpenAI-compatible
+      # endpoint. META_API_KEY is set in Coolify's environment, never in git:
+      # the owner's Opencode Go key, same as GreenForge.
+      - META_API_BASE_URL=https://opencode.ai/zen/go/v1
+      - META_MODEL=glm-5.3
+    ports:
+      - "8000:8000"

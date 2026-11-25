@@ -1,0 +1,85 @@
+"""The public demo on Modal: one container serves the built web app and the API from one origin.
+
+    cd web && npm ci && npm run build && cd ..
+    modal secret create sightline-meta META_API_KEY=...      # once
+    modal deploy deploy/modal_app.py
+
+The demo models are the *.ifc files in samples/ at deploy time, and the sample clash reports are in samples/reports/
+(not in git; see samples/README.md).
+
+One container, always: open scenes (and their edits) live in that process's memory, and so do the proposal
+limits. A second container would answer "Model not loaded" to half the requests. It is kept warm, so a visitor
+after a quiet spell never waits for a fresh one.
+"""
+from pathlib import Path
+
+import modal
+
+ROOT = Path(__file__).resolve().parents[1]
+APP_DIR = "/app"
+
+image = (
+    modal.Image.debian_slim(python_version="3.13")
+    .apt_install("libpango-1.0-0", "libpangoft2-1.0-0", "libharfbuzz0b", "libharfbuzz-subset0", "fonts-dejavu-core",  # WeasyPrint (PDF reports)
+                 "libgl1")  # OpenCASCADE's Python bindings (STEP models) link libGL and X11
+    .uv_sync(str(ROOT / "server"))
+    .env({
+        "SIGHTLINE_PROPOSE_PER_HOUR": "20",    # per visitor; every proposal is a paid Muse Spark call, a plan costs
+        "SIGHTLINE_PROPOSE_PER_DAY": "300",    # one per clash pair; for everyone
+        "SIGHTLINE_TRUST_FORWARDED": "0",      # Modal's edge strips a client's X-Forwarded-For and sets none; the peer is
+                                               # the visitor (measured Oct 30; limits.client_id): trust no header
+        "SIGHTLINE_MAX_SCENES": "8",           # open model sets kept in memory
+        "SIGHTLINE_MAX_REPORTS": "8",          # open clash reports (uploads are deleted when dropped)
+        "SIGHTLINE_UPLOAD_MAX_MB": "150",
+        "SIGHTLINE_ESCALATE_PER_HOUR": "3",    # second tries on Muse Wonder per visitor (each also a proposal); it bills
+        "SIGHTLINE_ESCALATE_PER_DAY": "30",    # every token, about $0.3-1 a try (docs/escalation.md); for everyone
+        "SIGHTLINE_WONDER_MAX_USD_DAY": "25",  # what Muse Wonder may cost in a day, all visitors (spend.py)
+        "SIGHTLINE_BUILT_VIEWS": "0",          # Show it built off unless the owner switches it on (settings.py)
+        "SIGHTLINE_BUILT_PER_HOUR": "6",       # built views per visitor (Muse Image + Muse Wonder judges, about
+        "SIGHTLINE_BUILT_PER_DAY": "60",       # $0.14-0.62 each); for everyone
+        "SIGHTLINE_CHAT_PER_HOUR": "40",       # chat messages per visitor; each is one or more Muse Spark calls
+        "SIGHTLINE_CHAT_PER_DAY": "1500",
+        "SIGHTLINE_VOICE_PER_HOUR": "60",      # spoken messages per visitor (Muse Voice Transcribe, $0.18 an audio hour)
+        "SIGHTLINE_VOICE_PER_DAY": "2000",
+        "SIGHTLINE_MODEL_UPLOAD_MAX_MB": "150",   # opens through the page in about two minutes (docs/uploads.md)
+        "SIGHTLINE_SCENE_BUDGET_MB": "300",       # open models' IFC bytes held: two of the biggest, about 2.5 GB
+        "SIGHTLINE_MODEL_UPLOADS_PER_HOUR": "10",  # visitors' own models (IFC or STEP), per visitor; for everyone
+        "SIGHTLINE_MODEL_UPLOADS_PER_DAY": "200",
+        "SIGHTLINE_PUBLIC_URL": "https://dodzikojo--orca-web.us-east.modal.run",   # what MCP clients show as ORCA's site
+        "SIGHTLINE_LINKS_PER_HOUR": "10",      # agent links (MCP) a visitor can make; for everyone a day
+        "SIGHTLINE_LINKS_PER_DAY": "500",
+        "SIGHTLINE_AGENT_CALLS_PER_HOUR": "600",  # MCP tool calls per link (fixes are also charged as proposals)
+        "SIGHTLINE_OPEN_WEIGHTS": "0",         # titles and triage on Muse Spark unless the owner switches the open-weights
+                                               # model on (owner settings; kept in the "sightline-settings" Modal Dict)
+    })
+    .add_local_dir(ROOT / "server" / "sightline", f"{APP_DIR}/server/sightline", ignore=["__pycache__"])
+    .add_local_dir(ROOT / "web" / "dist", f"{APP_DIR}/web/dist")
+    # Models (IFC and STEP), sample clash reports with their images, and the STEP demo's ready conversion
+    # (samples/step-cache: the converted IFC and its manifest, so the first visitor after a restart does not wait).
+    .add_local_dir(ROOT / "samples", f"{APP_DIR}/samples",
+                   ignore=lambda p: p.suffix.lower() not in {".ifc", ".step", ".stp", ".json", ".xml", ".png", ".jpg", ".jpeg"})
+)
+
+app = modal.App("orca")
+
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("sightline-meta")],
+    cpu=2,
+    memory=4096,
+    max_containers=1,
+    min_containers=1,  # kept warm through judging: no cold start, and open models outlive a quiet spell (about $3 a
+                       # day, docs/architecture/17); 0 lets it stop after the idle window below
+    scaledown_window=20 * 60,
+    timeout=10 * 60,  # a proposal with retries can take a few minutes
+)
+@modal.concurrent(max_inputs=64)  # linked pages hold an events stream each
+@modal.asgi_app()
+def web():
+    import sys
+
+    sys.path.insert(0, f"{APP_DIR}/server")
+    from sightline.app import app as fastapi_app
+
+    return fastapi_app

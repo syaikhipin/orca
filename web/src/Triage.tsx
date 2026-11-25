@@ -1,0 +1,250 @@
+import { Brain, ChevronDown, CircleCheck, ClipboardCheck, Flag, Info, RotateCcw, ScanSearch, Square } from "lucide-react";
+import { useEffect, useState } from "react";
+import type { TriageKind, TriageModel, TriageVerdict } from "./api";
+import { aiName } from "./aiNames";
+
+export const TRIAGE: Record<TriageKind, { label: string; cls: string; tip: string; colour: string; long: string }> = {
+  real_clash: { label: "real", cls: "bad", tip: "A real clash: something has to move", colour: "var(--fail)", long: "Real problem" },
+  modelling_error: { label: "model error", cls: "warn", tip: "A modelling mistake for the model's author", colour: "#d49a1c", long: "Model error" },
+  by_design: { label: "by design", cls: "", tip: "How the parts are meant to go together", colour: "#7d8fa6", long: "By design" },
+  non_physical: { label: "not physical", cls: "muted", tip: "A space, port or opening: not a physical clash", colour: "#c3ccd8", long: "Not physical" },
+  unknown: { label: "no answer", cls: "muted", tip: "The triage model did not answer", colour: "#e3e7ec", long: "No answer" },
+};
+const WHY: Record<TriageKind, string> = {
+  real_clash: "Something has to move",
+  modelling_error: "For the model's author to clean up",
+  by_design: "Parts that meet on purpose",
+  non_physical: "Spaces, ports, openings",
+  unknown: "Ask again, or open it",
+};
+
+/** The end of what the model is writing, from a word boundary, on one or two lines. */
+function tail(text: string) {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length <= 170) return t;
+  const cut = t.slice(-170);
+  return "…" + cut.slice(cut.indexOf(" ") + 1);
+}
+
+const BASIS_LABEL: Record<string, string> = { touch: "touch", non_physical: "not physical", same_element: "same element", requirement: "by requirement" };
+
+/** "50 touch · 49 not physical · 12 same element": what the rules settled, biggest first. */
+function ruleBreakdown(vs: TriageVerdict[]) {
+  const by: Record<string, number> = {};
+  for (const v of vs) { const k = BASIS_LABEL[v.basis ?? ""] ?? "other"; by[k] = (by[k] ?? 0) + 1; }
+  return Object.entries(by).sort((a, b) => b[1] - a[1]).map(([k, c]) => `${c} ${k}`).join(" · ");
+}
+
+const ORDER: TriageKind[] = ["real_clash", "modelling_error", "by_design", "non_physical", "unknown"];
+
+const COMPACT = "sightline.triage.compact";
+/** The user's choice of a compact card ("1"/"0"), or null when they have not chosen (compact once a run is done). */
+function storedCompact(): boolean | null {
+  try { const v = localStorage.getItem(COMPACT); return v == null ? null : v === "1"; } catch { return null; }
+}
+
+export interface TriageRun extends Omit<TriageModel, "requirements"> {
+  total: number; started: number; done: boolean; seconds?: number; error?: string;
+  stopped?: boolean;             // stopped part way: what was read stays, triaging again reads only the rest
+  canStop?: boolean;             // this visitor started it (or is the owner): the run is shared, nobody else stops it
+  requirements?: string | null;  // the requirements it was read under ("L3 · Strict"), when there were some
+  queued?: boolean;              // waits for the triage already under way (ORCA's checks)
+  following?: string | null;     // following the triage of an earlier list of the same checks
+}
+
+/** Bulk triage of the whole report, the first step: run it, watch it land, filter by verdict, set the noise aside. */
+export function TriageCard({ run, results, now, filter, onFilter, onRun, onStop, onSetAside, onFlag, live = [], onOpen, resolved = () => false, total, unread = 0, active, workers = null, forceCompact = false, requirements = null, stale = false, onRequirements }: {
+  run: TriageRun | null; results: Record<string, TriageVerdict>; now: number; total: number;
+  unread?: number;              // ORCA's checks: clashes on screen no reading holds for (a check run since), to triage
+
+  active?: TriageModel | null;  // the model a run would use now (server: /api/models), before one starts
+  workers?: number | null;      // how many clashes it reads at a time (server: SIGHTLINE_TRIAGE_WORKERS)
+  forceCompact?: boolean;       // the list is filtered to a pattern or root cause: give it the room (unless opened)
+  live?: { id: string; name: string; text: string }[]; onOpen?: (id: string) => void;
+  filter: TriageKind | null; onFilter: (k: TriageKind | null) => void; onRun: (rerun: boolean) => void;
+  onStop?: () => void;          // stop the run under way (shared on the server: it stops for everyone following it)
+  onSetAside: (ids: string[]) => void; onFlag: (ids: string[]) => void;
+  resolved?: (id: string) => boolean;  // fixed, set aside or flagged already
+  open?: number;
+  requirements?: string | null;  // the coordination requirements in use ("L3 · Strict")
+  stale?: boolean;               // read under other requirements: run again to apply these
+  onRequirements?: () => void;
+}) {
+  const [chosen, setChosen] = useState<boolean | null>(storedCompact);
+  const [openedAnyway, setOpenedAnyway] = useState(false);
+  useEffect(() => { setOpenedAnyway(false); }, [forceCompact]);
+  // Asked to stop: the button waits for the run's last event (under a second).
+  const [stopping, setStopping] = useState(false);
+  useEffect(() => { setStopping(false); }, [run?.started, run?.done]);
+  const ids = Object.keys(results);
+  const counts = Object.fromEntries(ORDER.map((k) => [k, ids.filter((id) => results[id].verdict === k).length])) as Record<TriageKind, number>;
+  const noise = ids.filter((id) => ["by_design", "non_physical"].includes(results[id].verdict));
+  const errors = ids.filter((id) => results[id].verdict === "modelling_error");
+  const noiseOpen = noise.filter((id) => !resolved(id));
+  const errorsOpen = errors.filter((id) => !resolved(id));
+  const byRule = ids.filter((id) => results[id].source === "rule").length;
+  const n = total || run?.total || 0;
+  const seconds = run ? Math.round(run.done ? run.seconds ?? 0 : Math.max(0, now - run.started) / 1000) : 0;
+  const model = run?.model ? aiName("triage") : "";
+  const state = !run ? "idle" : run.done ? "done" : "running";
+  const compact = forceCompact ? !openedAnyway : chosen ?? state !== "running";  // room for the list, open while it reads
+  const toggle = () => {
+    if (forceCompact) { setOpenedAnyway(compact); return; }  // for this filter only; the stored choice stays
+    setChosen(!compact);
+    try { localStorage.setItem(COMPACT, compact ? "0" : "1"); } catch { /* private window */ }
+  };
+  const about = run ? `${state === "done" ? `${seconds} s · ` : ""}${byRule} by rule · ${model || "starting"}` : "";
+
+  // One bar for the whole report: a segment per verdict (click to filter), the rest still to come.
+  const bar = (
+    <div className="triage-bar" role="group" aria-label="Clashes by verdict">
+      {ORDER.filter((k) => counts[k]).map((k) => (
+        <button key={k} className={filter === k ? "on" : ""} style={{ flexGrow: counts[k], background: TRIAGE[k].colour }}
+          data-tour={compact && k === "real_clash" ? "triage-real" : undefined}
+          aria-label={`${counts[k]} ${TRIAGE[k].long.toLowerCase()}`} data-tip-side="bottom"
+          data-tip={`${counts[k]} ${TRIAGE[k].long.toLowerCase()}: ${WHY[k].toLowerCase()} · ${filter === k ? "click to show every clash" : "click to show only these"}`}
+          onClick={() => onFilter(filter === k ? null : k)} />))}
+      {n > ids.length && <span className="rest" style={{ flexGrow: n - ids.length }} />}
+    </div>
+  );
+
+  // While running, the second stage's own bar: what the model has read, out of what it has to read.
+  const asked = ids.filter((id) => results[id].source !== "rule");
+  const askedCounts = Object.fromEntries(ORDER.map((k) => [k, asked.filter((id) => results[id].verdict === k).length])) as Record<TriageKind, number>;
+  const modelBar = (
+    <div className="triage-bar" aria-label={`${asked.length} of ${Math.max(0, n - byRule)} read by the model`}>
+      {ORDER.filter((k) => askedCounts[k]).map((k) => (
+        <span key={k} className="seg" style={{ flexGrow: askedCounts[k], background: TRIAGE[k].colour }} />))}
+      {n - byRule > asked.length && <span className="rest" style={{ flexGrow: n - byRule - asked.length }} />}
+    </div>
+  );
+
+  // Idle, the fold shows how triage works; once it has run, the verdicts and what to do with them.
+  const foldTip = state === "idle" ? (compact ? "How triage works" : "Hide how it works") : compact ? "Show the details" : "Show only the essentials";
+  return (
+    <section className={`triage ${state} ${compact ? "compact" : ""}`} data-tour="triage">
+      <div className="triage-head">
+        <span className="triage-icon"><ScanSearch size={15} aria-hidden /></span>
+        <div>
+          <h3>Triage{state === "idle" && <span className="triage-step">Step 1</span>}</h3>
+          {/* Folded, the count is the subtitle: the card is one line and its bar */}
+          {compact && state === "done" && run?.stopped ? <span className="triage-sub count-sub"><b>{ids.length}</b> of {n} sorted · stopped
+              <span className="triage-info" data-tip-tap data-tip={about} data-tip-side="bottom" aria-label={about}><Info size={13} aria-hidden /></span></span>
+            : compact && state === "done" ? <span className="triage-sub count-sub">
+              <b className={counts.real_clash ? "bad" : "ok"}>{counts.real_clash}</b>{counts.real_clash === 1 ? " needs a fix" : " need a fix"} of {n}
+              <span className="triage-info" data-tip-tap data-tip={about} data-tip-side="bottom" aria-label={about}><Info size={13} aria-hidden /></span></span>
+            : compact && state === "running" ? <span className="triage-sub count-sub"><b>{ids.length}</b> of {n} sorted · {seconds} s
+              <span className="triage-info" data-tip-tap data-tip={about} data-tip-side="bottom" aria-label={about}><Info size={13} aria-hidden /></span></span>
+            : <span className="triage-sub">{state === "idle" ? "Find the few that need a fix" : state === "running" ? "Sorting the clashes…"
+              : run?.stopped ? `Stopped: ${ids.length} of ${n} sorted` : "Every clash has a verdict"}</span>}
+        </div>
+        {state === "running" && onStop && run?.canStop && <button className="ibtn triage-stop" aria-label={stopping ? "Stopping" : "Stop triage"}
+          data-tip={stopping ? "Stopping…" : "Stop: what is read stays, and triaging again reads only the rest"} data-tip-side="left"
+          disabled={stopping} onClick={() => { setStopping(true); onStop(); }}>
+          <Square size={13} aria-hidden /></button>}
+        {run?.done && !compact && <button className="ibtn" aria-label="Triage again" data-tip="Triage again" data-tip-side="left" onClick={() => onRun(true)}>
+          <RotateCcw size={14} aria-hidden /></button>}
+        <button className="ibtn triage-fold" aria-expanded={!compact} aria-label={foldTip} data-tip={foldTip} data-tip-side="left" onClick={toggle}>
+          <ChevronDown size={15} aria-hidden /></button>
+      </div>
+
+      {/* The first step's one button, full width under the head, folded or not */}
+      {state === "idle" && <button className="btn primary triage-go" onClick={() => onRun(false)}>
+        <ScanSearch size={15} aria-hidden /> Triage all {n} clashes</button>}
+      {/* Readings stay with their clashes (from check to check, and after a stop or a failed read): only the rest is
+          left to read (one proposal) */}
+      {state === "done" && unread > 0 && <button className="btn small primary triage-unread" onClick={() => onRun(false)}
+        data-tip={run?.stopped ? "Read only the clashes the stopped triage left" : "Read only the clashes no triage holds for yet"} data-tip-side="bottom">
+        <ScanSearch size={13} aria-hidden /> {run?.stopped ? `Continue · ${unread} left` : `Triage ${unread} unread`}</button>}
+      {compact && state !== "idle" && bar}
+      {!compact && <>
+
+      {state === "idle" && <>
+        <p className="triage-lead">Most clash results are noise. Triage gives all <b>{n}</b> a verdict, so you only open the few that need a fix.</p>
+        <p className="hint">Sure cases (spaces, ports, touches) are settled by rule at once;{" "}
+          {aiName("triage")}{active?.open_weights ? ", an open-weights model," : ""} reads the rest
+          {workers ? `, ${workers} at a time,` : ""} and alike clashes once.</p>
+      </>}
+
+      {state === "running" && run && <>
+        {run.queued ? <p className="hint small">Waits for the triage already under way, then reads what it leaves.</p>
+          : run.following && <p className="hint small">Following the triage of an earlier list of these checks.</p>}
+        {!run.canStop && run.model && <p className="hint small">Shared with whoever started it: only they can stop it.</p>}
+        <div className="triage-stage done">
+          <CircleCheck size={15} aria-hidden />
+          <div>
+            <b>{byRule ? `${byRule} settled by rule` : "Checking the sure cases…"}</b>
+            {byRule > 0 && <small>{ruleBreakdown(ids.filter((id) => results[id].source === "rule").map((id) => results[id]))} · no model needed</small>}
+          </div>
+        </div>
+        <div className="triage-stage">
+          <Brain size={15} aria-hidden />
+          <div>
+            <b>{model || "The model"} has read {ids.length - byRule} of {Math.max(0, n - byRule)}</b>
+            <small>the rest{workers ? `, ${workers} at a time` : ""} · {seconds} s</small>
+          </div>
+        </div>
+        {modelBar}
+        {live.length > 0 && (
+          <div className="triage-live" aria-live="off">
+            <span className="triage-live-head"><Brain size={12} aria-hidden /> {model || "The model"} is reading {live.length} now</span>
+            {live.slice(-4).map((l) => (
+              <button key={l.id} className="triage-live-row" onClick={() => onOpen?.(l.id)} title={`Open ${l.name}`}>
+                <b>{l.name}</b><span>{tail(l.text)}</span>
+              </button>))}
+          </div>)}
+      </>}
+
+      {state === "done" && <>
+        <div className="triage-count">
+          <b className={counts.real_clash ? "bad" : "ok"}>{counts.real_clash}</b>
+          {counts.real_clash === 1 ? " needs a fix" : " need a fix"} <span className="hint">of {n} clashes</span>
+        </div>
+        {bar}
+      </>}
+
+      {state !== "idle" && ids.length > 0 && (
+        <div className="triage-rows">
+          {ORDER.filter((k) => counts[k]).map((k) => (
+            <button key={k} className={`triage-row ${filter === k ? "on" : ""}`} aria-pressed={filter === k}
+              data-tour={k === "real_clash" ? "triage-real" : undefined}
+              data-tip={filter === k ? "Show every clash again" : `Show only these in the list`} data-tip-side="right"
+              onClick={() => onFilter(filter === k ? null : k)}>
+              <i style={{ background: TRIAGE[k].colour }} />
+              <span className="lbl">{TRIAGE[k].long}<small>{WHY[k]}</small></span>
+              <b>{counts[k]}</b>
+            </button>))}
+        </div>)}
+
+      {state === "done" && (noise.length > 0 || errors.length > 0) && (
+        <div className="triage-actions">
+          {noise.length > 0 && (noiseOpen.length
+            ? <button className="btn small" onClick={() => onSetAside(noiseOpen)} data-tip="Mark the by-design and not-physical clashes as reviewed" data-tip-side="top">
+              <CircleCheck size={13} aria-hidden /> Set aside {noiseOpen.length} as noise</button>
+            : <span className="chip ok"><CircleCheck size={12} aria-hidden /> {noise.length} set aside</span>)}
+          {errors.length > 0 && (errorsOpen.length
+            ? <button className="btn small" onClick={() => onFlag(errorsOpen)} data-tip="Flag the model errors for their author" data-tip-side="top">
+              <Flag size={13} aria-hidden /> Flag {errorsOpen.length} for their authors</button>
+            : <span className="chip warn"><Flag size={12} aria-hidden /> {errors.length} flagged</span>)}
+        </div>)}
+
+      {run && (run.note || run.error) && <p className={run.error ? "bad small" : "hint small"}>{run.error || run.note}</p>}
+      {run && run.done && (requirements || run.requirements || stale) && (
+        <p className="triage-req">
+          <ClipboardCheck size={13} aria-hidden />
+          {stale ? <>Read under {run.requirements ? `requirements ${run.requirements}` : "ORCA's defaults"}; requirement rules apply now, the
+            {requirements ? ` ${requirements}` : " new"} reading on the next run.
+            <button className="btn small" onClick={() => onRun(true)}>Triage again</button></>
+            : <>Read under requirements {run.requirements ?? requirements}{onRequirements && <button className="btn small ghost" onClick={onRequirements}>Edit</button>}</>}
+        </p>)}
+      {run && state !== "idle" && (
+        <p className="triage-meta">
+          {state === "done" && <>{seconds} s · {byRule} by rule · </>}
+          {run.model
+            ? <><span className={`chip small ${run.open_weights ? "ok" : ""}`} title={run.note}>{run.open_weights ? "open weights" : "Meta API"}</span> {model}</>
+            : "starting…"}
+        </p>)}
+      </>}
+    </section>
+  );
+}

@@ -1,0 +1,1453 @@
+"""The operations ORCA offers, shared by the web API and the MCP server so they never drift."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import tempfile
+import threading
+import uuid
+from collections import Counter
+
+import ifcopenshell.api
+import ifcopenshell.geom
+import ifcopenshell.util.element
+import ifcopenshell.util.system
+import numpy as np
+from dataclasses import asdict
+from pathlib import Path
+
+from . import agent, checks, connections, datums, demos, detect, domains, edits, escalation, facets, hosts, journal, properties, reports, requirements, settings, spend, step, verify
+from .limits import env_int
+from .meta_client import ChatModel, MetaChatModel, escalation_model, model_label
+from .scene import IfcScene, is_provision, step_source
+
+SAMPLES = Path(__file__).resolve().parents[2] / "samples"
+# Each open scene holds its federated models in memory; a public server keeps only the most recent ones.
+MAX_SCENES = env_int("SIGHTLINE_MAX_SCENES", 0)  # 0 = no limit
+# Open model sets also held within a size budget: the IFC bytes they were opened from, a stand-in for memory (a scene
+# holds several times its file: docs/uploads.md). 0 = by count only.
+SCENE_BUDGET_MB = env_int("SIGHTLINE_SCENE_BUDGET_MB", 0)
+HOSTS_TIMEOUT_S = env_int("SIGHTLINE_HOSTS_TIMEOUT_S", 60)   # a host reading that takes longer (a cold open-weights host) leaves the defaults
+LAST_KEPT = 200        # the last try per clash pair kept for a second try to read (docs/escalation.md)
+PATTERNS_KEPT = 64     # Muse's readings of report patterns kept (plans.read_patterns)
+MAX_REPORTS = env_int("SIGHTLINE_MAX_REPORTS", 0)  # open clash reports kept, same rule
+# Uploaded models and STEP conversions live here; a converted STEP is cached by its hash (`step-cache`).
+MODELS = Path(tempfile.gettempdir()) / "sightline-models"
+MODEL_SUFFIXES = {".ifc"} | step.SUFFIXES
+
+
+# Clash tests the demo's sample reports leave out: site context, rooms and proxies are not coordination problems.
+# Uploaded reports are kept whole. Comma-separated IFC classes; empty keeps everything.
+SAMPLE_EXCLUDE = tuple(c.strip() for c in os.environ.get(
+    "SIGHTLINE_SAMPLE_EXCLUDE", "IfcGeographicElement,IfcSpace,IfcBuildingElementProxy").split(",") if c.strip())
+
+
+class StaleLayout(Exception):
+    """A model was named by a position the scene no longer has at that name (another tab or an agent changed the
+    list): the route answers 409, and the page reloads the files."""
+
+
+class Workspace:
+    def __init__(self, samples: Path = SAMPLES, model: ChatModel | None = None, max_scenes: int = MAX_SCENES,
+                 max_reports: int = MAX_REPORTS, keep=None, hosts_model: ChatModel | None = None,
+                 budget_mb: int = SCENE_BUDGET_MB, escalation_model: ChatModel | None = None):
+        self.samples = samples
+        self.max_scenes = max_scenes
+        self.budget = budget_mb << 20
+        self.sizes: dict[str, int] = {}   # scene id → the IFC bytes it was opened from
+        self.max_reports = max_reports
+        # Ids (scenes or reports) to evict last: what live agent links point at (app.py). Called at eviction time.
+        self.keep = keep or (lambda: set())
+        self.names: dict[str, list[str]] = {}       # scene id → the file names it was opened from
+        self.scenes: dict[str, IfcScene] = {}
+        self.reports: dict[str, reports.Report] = {}
+        self._matches: dict[tuple[str, str], dict] = {}
+        # Scene id → its kept checks and what each clash keeps from check to check (checks.py, docs/detection.md).
+        self.checks: dict[str, checks.Register] = {}
+        # Scene id → {file index: {"step": original STEP, "manifest": converter manifest}} for models opened from STEP,
+        # and the scene's own temporary folders (uploads, conversions; one per opening or adding), deleted with it.
+        self.sources: dict[str, dict[int, dict]] = {}
+        self._roots: dict[str, list[Path]] = {}
+        # Scene id → its edit log: every kept edit, by whom, for which clash (journal.py, docs/manual-edits.md).
+        self.journals: dict[str, journal.Journal] = {}
+        # Geometry trials edit the model and undo; anything touching a scene's geometry holds this.
+        self.lock = threading.RLock()
+        self._model = model
+        # What reads hosts for openings (hosts.read): given, or the triage model; none when only a proposal model was
+        # given (tests script that one).
+        self._hosts_model = hosts_model if hosts_model is not None else (False if model is not None else None)
+        # A second try's model: given (tests script it), else a fresh Muse Wonder client per try, so its usage is that
+        # try's alone (meta_client.escalation_model).
+        self._escalation_model = escalation_model
+        # (scene id, GlobalId, GlobalId) → the last try at that pair (asdict of agent.Result), for a second try to
+        # read: what was tried and why it failed. Pairs are sorted; the oldest go past LAST_KEPT.
+        self._last: dict[tuple[str, str, str], tuple[tuple, dict]] = {}   # → (what it was tried on, the try)
+        self._last_lock = threading.Lock()
+        # Scene id → (the requirements a stays rule was made from, the rule): `requirements.stays_rule`, per request.
+        self._stays: dict[str, tuple[object, object]] = {}
+        # (report id, scene id, pattern ids, triage prompt) → Muse's reading of those patterns (plans.read_patterns),
+        # made once and shared by the route, the chat and MCP; the oldest go past PATTERNS_KEPT. One lock per reading
+        # being made, so a second caller waits for it instead of paying for it again.
+        self._patterns: dict[tuple, dict] = {}
+        self._pattern_locks: dict[tuple, threading.Lock] = {}
+        self._patterns_lock = threading.Lock()
+
+    @property
+    def model(self) -> ChatModel:
+        if self._model is None:
+            self._model = MetaChatModel()
+        return self._model
+
+    @property
+    def hosts_model(self) -> ChatModel | None:
+        """The model that reads hosts: given, or the triage model as this request resolves it (the owner's choice,
+        else everyone's), like triage and titles. Never cached: the open-weights setting may change."""
+        if self._hosts_model is not None:
+            return self._hosts_model or None
+        from .meta_client import triage_model
+        try:
+            return triage_model(timeout_s=HOSTS_TIMEOUT_S)[0]
+        except Exception:   # no key here: walls and slabs only, as without a reading
+            return None
+
+    def list_samples(self) -> list[str]:
+        return sorted(p.name for p in self.samples.iterdir() if p.suffix.lower() in MODEL_SUFFIXES)
+
+    def open(self, names: list[str], classify_with: ChatModel | None = None, on_event=lambda e: None) -> str:
+        """Open one or more sample models that share coordinates (e.g. structure + MEP + architecture). IFC opens as
+        is; STEP is converted first (`step.convert`, cached by its hash)."""
+        return self.open_paths([self._sample(n) for n in names], classify_with=classify_with, on_event=on_event)
+
+    def open_paths(self, paths: list[Path], root: Path | None = None, classify_with: ChatModel | None = None,
+                   on_event=lambda e: None) -> str:
+        """Open models from these paths (samples, or an upload kept in `root`, which is deleted with the scene)."""
+        if not paths:
+            raise FileNotFoundError("no models given")
+        try:
+            ifc_paths, sources, root = self._as_ifc(paths, 0, root, classify_with, on_event)
+            on_event({"type": "opening", "files": len(ifc_paths)})
+            # Room first: a new scene peaks while it opens, so the held ones over the budget go before, not after.
+            self._evict(sum(p.stat().st_size for p in ifc_paths))
+            scene = IfcScene(ifc_paths)
+            # Pay the one-off triangulation now, not on the first check; a big model reports how far it has got.
+            scene.bounds(lambda done, total: on_event({"type": "boxes", "done": done, "total": total}))
+        except BaseException:
+            if root is not None:
+                shutil.rmtree(root, ignore_errors=True)
+            raise
+        scene_id = uuid.uuid4().hex[:12]
+        # Models wholly from STEP are a machine (domains.infer); the requirements may say otherwise.
+        scene.domain = domains.MACHINES if len(sources) == len(paths) else domains.CONSTRUCTION
+        scene.stays_rule = lambda gid, sid=scene_id: self._stays_rule(sid)(gid)
+        self.scenes[scene_id] = scene
+        self.sources[scene_id] = sources
+        self.names[scene_id] = [p.name for p in paths]
+        self.sizes[scene_id] = sum(p.stat().st_size for p in ifc_paths)
+        if root is not None:
+            self._roots[scene_id] = [root]
+        self._evict(0, scene_id)
+        return scene_id
+
+    def _as_ifc(self, paths: list[Path], start: int, root: Path | None, classify_with, on_event):
+        """Each model as the IFC the scene opens: IFC as it is, STEP converted (`step.convert`, cached by its hash) into
+        `root` (a new folder when none is given). Returns the IFC paths, the STEP sources by file index (from
+        `start`) and the folder. A folder made here is deleted again when a conversion fails."""
+        made = root is None
+        ifc_paths, sources = [], {}
+        try:
+            for k, path in enumerate(paths):
+                if path.suffix.lower() not in step.SUFFIXES:
+                    ifc_paths.append(path)
+                    continue
+                if root is None:
+                    MODELS.mkdir(parents=True, exist_ok=True)
+                    root = Path(tempfile.mkdtemp(dir=MODELS))
+                ifc, manifest = step.convert(path, root / f"converted-{start + k}", classify_with, self.step_cache,
+                                             on_event)
+                ifc_paths.append(ifc)
+                sources[start + k] = {"step": path, "manifest": manifest}
+        except BaseException:
+            if made and root is not None:
+                shutil.rmtree(root, ignore_errors=True)
+            raise
+        return ifc_paths, sources, root
+
+    def add_samples(self, scene_id: str, names: list[str], classify_with: ChatModel | None = None,
+                    on_event=lambda e: None) -> list[int]:
+        """Add sample models to an open scene (`add_models`)."""
+        return self.add_models(scene_id, [self._sample(n) for n in names], classify_with=classify_with,
+                               on_event=on_event)
+
+    def _sample(self, name: str) -> Path:
+        path = (self.samples / name).resolve()
+        if path.parent != self.samples.resolve() or not path.exists():
+            raise FileNotFoundError(name)
+        return path
+
+    def add_models(self, scene_id: str, paths: list[Path], root: Path | None = None,
+                   classify_with: ChatModel | None = None, on_event=lambda e: None) -> list[int]:
+        """Add models to an open scene, after the files it has (docs/add-and-remove-models.md): their file indexes.
+        They share its coordinates; STEP is converted as `open_paths` does, and `root` (an upload's folder) is kept
+        with the scene. Everything kept stays (edits, fixes, checks, readings); run the checks again to see the new
+        clashes. Refused (ValueError, in words): STEP into building models or the reverse, a name already open, the
+        scene past the byte budget. The folder is deleted when it fails."""
+        try:
+            self.check_adding(scene_id, paths)
+            start = len(self.names[scene_id])
+            ifc_paths, sources, root = self._as_ifc(paths, start, root, classify_with, on_event)
+            incoming = sum(p.stat().st_size for p in ifc_paths)
+            with self.lock:
+                self.check_adding(scene_id, paths, incoming)   # again: another request may have added meanwhile
+                if len(self.names[scene_id]) != start:
+                    raise StaleLayout("The models changed: reload them.")
+                on_event({"type": "opening", "files": len(ifc_paths)})
+                self._evict(incoming, scene_id)   # room first, as opening makes it: the other scenes go, never this one
+                scene = self.scene(scene_id)
+                added = scene.add_files(ifc_paths, lambda done, total: on_event({"type": "boxes", "done": done,
+                                                                                  "total": total}))
+                self.names[scene_id] = [*self.names[scene_id], *(p.name for p in paths)]
+                self.sources.setdefault(scene_id, {}).update(sources)
+                self.sizes[scene_id] = self.sizes.get(scene_id, 0) + incoming
+                if root is not None:
+                    self._roots.setdefault(scene_id, []).append(root)
+                self._files_changed(scene_id)
+        except BaseException:
+            if root is not None:
+                shutil.rmtree(root, ignore_errors=True)
+            raise
+        return added
+
+    def check_adding(self, scene_id: str, paths: list[Path], incoming: int | None = None) -> None:
+        """Why these models may not join the scene (ValueError, in words; KeyError for a scene not open); `incoming`:
+        their IFC bytes, once known (the budget)."""
+        self.scene(scene_id)
+        names, open_ = [p.name for p in paths], self.names[scene_id]
+        if not names:
+            raise FileNotFoundError("no models given")
+        if len(set(names)) < len(names):
+            raise ValueError("A file was given twice.")
+        already = next((n for n in names if n in open_), None)
+        if already:
+            raise ValueError(f"{already} is already open.")
+        machine = bool(open_) and len(self.sources.get(scene_id, {})) == len(open_)
+        steps = [Path(n).suffix.lower() in step.SUFFIXES for n in names]
+        if any(steps) and not machine:
+            raise ValueError("A STEP machine can't join building models yet: open it on its own.")
+        if not all(steps) and self.sources.get(scene_id):
+            raise ValueError("A building model can't join a STEP machine yet: open it on its own.")
+        total = self.sizes.get(scene_id, 0) + (incoming or 0)
+        if incoming is not None and self.budget and total > self.budget:
+            raise ValueError(f"With these the open models would be {_mb(total)}, over this server's "
+                             f"{_mb(self.budget)} for one set: open fewer models together.")
+
+    def remove_model(self, scene_id: str, index: int, name: str) -> dict:
+        """Take one model out of an open scene (docs/add-and-remove-models.md). `name` is the file the page means at
+        `index`: StaleLayout when the scene's list has changed since. Its clashes leave every kept check and the list,
+        nothing is detected again; the edits kept in it stay in the log, marked, never undone; the edits in the other
+        models stay. An uploaded file is deleted. Refused (ValueError) for the only model."""
+        s = self.scene(scene_id)
+        with self.lock:
+            names = self.names[scene_id]
+            if not 0 <= index < len(names) or names[index] != name:
+                raise StaleLayout("The models changed: reload them.")
+            if len(names) == 1:
+                raise ValueError("This is the only model: open others instead.")
+            elements = {e.GlobalId for e in s.models[index].by_type("IfcElement")}
+            path, source = s.paths[index], self.sources.get(scene_id, {}).get(index)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            was = s.revision
+            s.remove_file(index)
+            shift = lambda i: i - (i > index)
+            self.names[scene_id] = [n for i, n in enumerate(names) if i != index]
+            self.sources[scene_id] = {shift(i): src for i, src in self.sources.get(scene_id, {}).items() if i != index}
+            self.sizes[scene_id] = max(0, self.sizes.get(scene_id, 0) - size)
+            self._delete_upload(scene_id, [path, *([source["step"], source["manifest"]] if source else [])])
+            edits_gone = self.journal(scene_id).drop_file(index, name, elements)
+            register = self.checks.get(scene_id)
+            clashes_gone, report = 0, None
+            if register is not None:
+                register.absorb(self.reports.get(register.report_id or ""))
+                clashes_gone = register.drop_file(name, elements)
+                for check in register.checks.values():   # a removal makes no clash: what was current still is
+                    if check.revision == was:
+                        check.revision = s.revision
+                if register.checks:
+                    report = self._union(scene_id)
+            self._files_changed(scene_id)
+            revision = s.revision
+            summaries = register.summaries(revision) if register is not None else []
+        return {"files": self.names[scene_id], "step": self.step_files(scene_id), "revision": revision,
+                "layout": s.layout, "removed": {"name": name, "clashes": clashes_gone, "edits": edits_gone},
+                "report": self.report_summary(report.id) if report is not None else None, "checks": summaries}
+
+    def _delete_upload(self, scene_id: str, files: list[Path]) -> None:
+        """Delete a removed model's files that live in the scene's own folders (an upload, a conversion), never a
+        sample; a folder that no longer holds any of the scene's files goes too."""
+        roots = self._roots.get(scene_id, [])
+        inside = lambda p, r: Path(p).resolve().is_relative_to(r.resolve())
+        for f in files:
+            if any(inside(f, r) for r in roots):
+                Path(f).unlink(missing_ok=True)
+        s = self.scene(scene_id)
+        held = [*s.paths, *(Path(src["step"]) for src in self.sources.get(scene_id, {}).values())]
+        for r in list(roots):
+            if not any(inside(p, r) for p in held):
+                shutil.rmtree(r, ignore_errors=True)
+                roots.remove(r)
+
+    def _files_changed(self, scene_id: str) -> None:
+        """What was worked out from a scene's set of files, worked out again on next use: what stays in place, which
+        model element each report clash is, the readings of report patterns, the last tries (their checks ran on
+        other files). The domain follows the files (all from STEP: a machine)."""
+        s = self.scenes[scene_id]
+        s.domain = domains.MACHINES if len(self.sources.get(scene_id, {})) == len(self.names[scene_id]) \
+            else domains.CONSTRUCTION
+        self._stays.pop(scene_id, None)
+        for key in [k for k in self._matches if k[1] == scene_id]:
+            self._matches.pop(key, None)
+        with self._patterns_lock:
+            for key in [k for k in self._patterns if k[1] == scene_id]:
+                self._patterns.pop(key, None)
+        with self._last_lock:
+            for key in [k for k in self._last if k[0] == scene_id]:
+                self._last.pop(key, None)
+
+    def _evict(self, incoming: int, newest: str | None = None) -> None:
+        """Drop the oldest scenes (those no live agent link holds last) until the count and byte budget leave room:
+        for a scene of `incoming` bytes about to open, or with `newest` (never dropped) just added."""
+        def over() -> bool:
+            count = len(self.scenes) + (newest is None)
+            return bool((self.max_scenes and count > self.max_scenes)
+                        or (self.budget and sum(self.sizes.values()) + incoming > self.budget))
+        while len(self.scenes) > (newest is not None) and over():
+            old = self._oldest(self.scenes, newest)
+            del self.scenes[old]
+            self.sizes.pop(old, None)
+            self.sources.pop(old, None)
+            self.names.pop(old, None)
+            register = self.checks.pop(old, None)
+            if register is not None:
+                register.drop()
+            self.journals.pop(old, None)
+            self._stays.pop(old, None)
+            with self._last_lock:
+                for key in [k for k in self._last if k[0] == old]:
+                    self._last.pop(key, None)
+            for root in self._roots.pop(old, []):
+                shutil.rmtree(root, ignore_errors=True)
+
+    def requirements_for(self, scene_id: str) -> requirements.Doc | None:
+        """The requirements that decide a scene's domain and what stays in place: the user's, when switched on
+        (`requirements.current()`), else the demo's own when the scene is a demo set (`demos.requirements_for`), else
+        none (the models decide: `domains.infer`, `domains.STAYS`). Clearance, edit limits and prompt guidance come
+        only from the user's (`fix_settings`)."""
+        doc = requirements.current()
+        if doc is not None:
+            return doc
+        return demos.requirements_for(self.names.get(scene_id) or [])
+
+    def _stays_rule(self, scene_id: str):
+        doc = self.requirements_for(scene_id)
+        held = self._stays.get(scene_id)
+        if held is None or held[0] is not doc:
+            held = (doc, requirements.stays_rule(self.scenes[scene_id], doc))
+            self._stays[scene_id] = held
+        return held[1]
+
+    @property
+    def step_cache(self) -> Path:
+        """Converted STEP files by hash. `samples/step-cache` when it exists (the demo ships its conversion, so the
+        first visitor after a restart does not wait for the part classes), else a temporary folder."""
+        shipped = self.samples / "step-cache"
+        return shipped if shipped.is_dir() else MODELS / "step-cache"
+
+    def step_files(self, scene_id: str) -> dict[int, str]:
+        """File index → the STEP file name it was converted from, for the models of this scene that came from STEP."""
+        return {i: Path(src["step"]).name for i, src in self.sources.get(scene_id, {}).items()}
+
+    def scene(self, scene_id: str) -> IfcScene:
+        return self.scenes[scene_id]
+
+    def journal(self, scene_id: str) -> journal.Journal:
+        """The scene's edit log (journal.py), made on first use."""
+        self.scene(scene_id)
+        with self.lock:
+            return self.journals.setdefault(scene_id, journal.Journal())
+
+    def classes(self, scene_id: str) -> dict[str, list[str]]:
+        """GlobalId → [IFC class, name] of every physical element (what has a box)."""
+        s = self.scene(scene_id)
+        with self.lock:
+            return {g: [s.element(g).ifc_class, s.element(g).name or s.element(g).ifc_class] for g in s.bounds()}
+
+    def datums(self, scene_id: str) -> dict:
+        """Levels, grids and each element's storey (datums.read). A scene opened from samples may take its grid from
+        the samples' `<prefix>-Grids.ifc`; an upload only from its own files."""
+        s = self.scene(scene_id)
+        with self.lock:
+            return datums.read(s, self.names.get(scene_id, []), None if self._roots.get(scene_id) else self.samples)
+
+    def describe(self, scene_id: str, global_id: str) -> dict:
+        """An element, with what it is linked to by kind (connections.links_of: joints, assembly, hosted, what it rests
+        on and supports, contacts), its systems and the assembly it is part of."""
+        s = self.scene(scene_id)
+        with self.lock:
+            g = self.connections(scene_id)
+            links = connections.links_of(s, global_id, self._contacts(scene_id))
+        part_of = next(({"global_id": w, "name": a["name"], "parts": len(a["parts"])}
+                        for w, a in g["assemblies"].items() if global_id in a["parts"]), None)
+        named = {kind: [{"global_id": o, "name": s.element(o).name, "ifc_class": s.element(o).ifc_class} for o in gids]
+                 for kind, gids in links.items()}
+        return {**asdict(s.element(global_id)), "links": named, "systems": g["systems"].get(global_id, []),
+                "part_of": part_of}
+
+    def properties(self, scene_id: str, global_id: str, file: int | None = None) -> dict:
+        """Everything the model says about one object (properties.py): every attribute, its type, every property and
+        quantity set (the type's marked), units, materials, classifications, groups, documents, its storey and path.
+        `file` picks the model when federated files repeat a GlobalId (a breadcrumb's storey). KeyError for an object
+        the scene doesn't have."""
+        s = self.scene(scene_id)
+        with self.lock:
+            return properties.properties(s, global_id, file)
+
+    def facets(self, scene_id: str) -> dict:
+        """The filters' index (facets.py): every value a filter can match, with the elements that have it. Kept on the
+        scene until a kept edit changes it. Read and built outside the lock (it only reads, as the requirements'
+        inventory does), so it never waits for the opening check and a big model's first build stalls no one; kept
+        only if no edit landed meanwhile."""
+        s = self.scene(scene_id)
+        at = facets.version(s)
+        ready = facets.cached(s)
+        if ready is not None:
+            return ready
+        built = facets.build(s)
+        with self.lock:
+            if facets.version(s) == at:
+                facets.keep(s, built, at)
+        return built
+
+    def _contacts(self, scene_id: str) -> list:
+        register = self.checks.get(scene_id)
+        return register.contacts() if register is not None else []
+
+    def connections(self, scene_id: str) -> dict:
+        """What is linked to what in the open models (connections.graph), with the last check's contacts."""
+        s = self.scene(scene_id)
+        with self.lock:
+            return connections.graph(s, self._contacts(scene_id))
+
+    def clearance(self, scene_id: str, element: str | None = None, other: str | None = None) -> float:
+        """The clearance a check of this pair keeps, in metres: what the requirements ask of it (`fix_settings`), their
+        floor when there is no pair, else the default (`requirements.DEFAULT_CLEARANCE_M`). A check by hand, by chat or
+        over MCP then agrees with keeping the fix."""
+        doc = requirements.current()
+        if doc is None:
+            return requirements.DEFAULT_CLEARANCE_M
+        if element and other and element != other:
+            return self.fix_settings(scene_id, element, other)["clearance_m"]
+        return requirements.resolve(doc).fix_clearance_mm / 1000
+
+    def verify_move(self, scene_id: str, moved: list[str], delta_m: list[float], clearance_m: float | None = None,
+                    obstacles: list[str] = ()) -> dict:
+        """Check a move without keeping it. It keeps its joints (connections.plan_move): what it takes along is moved
+        too (`placements`), the segments it stretches come back as `preview` meshes, and `joints` says what it carried
+        and stretched. A move that can't keep them fails without being tried, with the `reason` (and `joints`: what it
+        would pull apart from). With `obstacles` (what the move must clear), what the moved elements stand on is kept
+        as a proposal keeps it (`verify.supports`): slid along a slab is not a clash, lifted off it is refused
+        (`reason`). Without them, every contact counts. The clearance: given, else the pair's (`clearance`)."""
+        s = self.scene(scene_id)
+        if clearance_m is None:
+            clearance_m = self.clearance(scene_id, moved[0] if moved else None, obstacles[0] if obstacles else None)
+        with self.lock:
+            plan = connections.plan_move(s, moved, delta_m, refit=connections.refit_moves())
+            if not plan.ok:
+                return {"passed": False, "hits": [], "min_clearance_m": None, "checked_against": 0, "placements": {},
+                        "reason": plan.refused, "joints": {"refused_at": plan.refused_at}}
+            if not plan.plain:
+                t = connections.trial_move(s, plan, clearance_m, preview=True)
+                return {"passed": not t.hits, "hits": [asdict(h) for h in t.hits], "min_clearance_m": t.least,
+                        "checked_against": t.checked, "placements": t.placements, "preview": t.preview,
+                        "reason": None, "joints": plan.edit(s, moved)}
+            sup = verify.supports(s, moved, set(obstacles), clearance_m) if obstacles else None
+            with edits.scratch(s, {s.index_of(g) for g in moved}):   # undone: kept edits stay undoable
+                placements = s.translate(moved, tuple(delta_m))
+                try:
+                    v = verify.check(s, moved, clearance_m=clearance_m)
+                    hits, held, why = verify.keep_supports(s, sup, v.hits) if sup else (v.hits, set(), None)
+                    if held and not hits and not why:
+                        v = verify.check(s, moved, clearance_m=clearance_m, ignore=held)
+                        hits = v.hits
+                finally:
+                    s.translate(moved, tuple(-d for d in delta_m))
+        return {**asdict(v), "passed": not hits and not why, "hits": [asdict(h) for h in hits], "reason": why,
+                "placements": placements}
+
+    def propose(self, scene_id: str, element_a: str, element_b: str, distance_m: float | None = None,
+                images: list[str] | None = None, notes: str = "", report_id: str | None = None,
+                clash_id: str | None = None, on_event=None, escalate_check=None) -> dict:
+        """With a report clash, its Navisworks distance and images go to the model too (images are what let
+        the model find openings and free space; spikes/README.md, spike 4).
+
+        When escalations are automatic (`settings.escalation()` "auto") and nothing verified, the clash goes on to a
+        second try at once, if `escalate_check` (the caller's caps: why not, or None) allows it."""
+        clash = self.clash_for(element_a, element_b, distance_m, images, notes, report_id, clash_id, scene_id)
+        stamp = self._stamp(scene_id)
+        result = asdict(agent.resolve(self.scene(scene_id), clash, self.model, pack=domains.of(self, scene_id),
+                                      on_event=on_event, lock=self.lock,
+                                      trials=on_event is not None, hosts_model=self.hosts_model,
+                                      **self.fix_settings(scene_id, element_a, element_b)))
+        self._remember(scene_id, element_a, element_b, result, stamp)
+        if (escalate_check is not None and not result["options"] and not result.get("recommendation")
+                and settings.escalation() == "auto"):
+            why = escalate_check()
+            if why:
+                if on_event:
+                    on_event({"type": "note", "text": f"No second try: {why}"})
+                return result
+            try:
+                return self.escalate(scene_id, element_a, element_b, distance_m, images, notes, report_id, clash_id,
+                                     on_event)
+            except Exception as e:  # noqa: BLE001 - the first try stands; say why the second didn't happen
+                note = f"The second try failed ({type(e).__name__}: {str(e)[:160]}); this is the first try's result."
+                if on_event:
+                    on_event({"type": "note", "text": note})
+                return {**result, "note": note}
+        return result
+
+    def _pair(self, scene_id: str, a: str, b: str) -> tuple[str, str, str]:
+        return (scene_id, *sorted((a, b)))
+
+    def _stamp(self, scene_id: str) -> tuple:
+        """What a try's options were verified on: the scene's revision (every kept edit bumps it) and the
+        coordination requirements in force."""
+        return (self.scene(scene_id).revision, requirements.current_id())
+
+    def _remember(self, scene_id: str, a: str, b: str, result: dict, stamp: tuple) -> None:
+        key = self._pair(scene_id, a, b)
+        with self._last_lock:
+            self._last.pop(key, None)
+            self._last[key] = (stamp, result)
+            while len(self._last) > LAST_KEPT:
+                self._last.pop(next(iter(self._last)), None)
+
+    def last_try(self, scene_id: str, a: str, b: str) -> dict | None:
+        """The last try at this pair in this scene (a first try, or a second try with the first's carried in), while
+        its options still hold: none once an edit was kept in the scene or the requirements changed since, because
+        its verified options were checked against a model or rules that are gone."""
+        hit = self._last.get(self._pair(scene_id, a, b))
+        if hit is None or scene_id not in self.scenes or hit[0] != self._stamp(scene_id):
+            return None
+        return hit[1]
+
+    def escalate(self, scene_id: str, element_a: str, element_b: str, distance_m: float | None = None,
+                 images: list[str] | None = None, notes: str = "", report_id: str | None = None,
+                 clash_id: str | None = None, on_event=None) -> dict:
+        """A second, longer try at a clash on a larger model (docs/escalation.md): it reads the last try at this pair
+        (what was tried and why it failed, the fixes found), the elements those ideas ran into and a wider
+        neighbourhood (escalation.brief), with every kind of fix there is, combined fixes included, for up to two
+        rounds through the same check. The first try's fixes stay: the reply's options are both tries' fixes in one
+        ranked list, each with the model that found it, and its attempts both tries'. Raises ValueError where the
+        requirements allow no edit (a recommendation is all there is)."""
+        # What it may cost is held from the start: the request's claim of it (spend.claim) is taken over at once.
+        with spend.held(escalation.ESTIMATE_USD):
+            return self._escalate(scene_id, element_a, element_b, distance_m, images, notes, report_id, clash_id,
+                                  on_event)
+
+    def _escalate(self, scene_id: str, element_a: str, element_b: str, distance_m: float | None,
+                  images: list[str] | None, notes: str, report_id: str | None, clash_id: str | None,
+                  on_event) -> dict:
+        clash = self.clash_for(element_a, element_b, distance_m, images, notes, report_id, clash_id, scene_id)
+        fix = self.fix_settings(scene_id, element_a, element_b)
+        if fix.get("recommend"):
+            raise ValueError(f"Nothing may be edited here ({fix['recommend']}), so there is no second try to make.")
+        scene = self.scene(scene_id)
+        first = self.last_try(scene_id, element_a, element_b)
+        stamp = self._stamp(scene_id)
+        model = self._escalation_model or escalation_model()
+        label = model_label(getattr(model, "model", "") or "") or "Muse Wonder"
+        if on_event:
+            # The first try as it stands (what it understood, its ideas and its verified options), so a page that
+            # didn't watch it (chat) shows the second's ideas after the right ones, and keeps those options if the
+            # second try fails.
+            on_event({"type": "escalating", "model": label, "first": bool(first),
+                      "first_try": {k: first.get(k) for k in ("understanding", "advice", "attempts", "options")}
+                      if first else None})
+        clearance = fix.get("clearance_m", requirements.DEFAULT_CLEARANCE_M)
+        with self.lock:
+            brief = escalation.brief(scene, clash, first, clearance)
+        fix["guidance"] = fix.get("guidance", "") + "\n" + domains.prompt("escalation", domains.of(self, scene_id))
+        second = asdict(agent.resolve(scene, clash, model, pack=domains.of(self, scene_id), on_event=on_event,
+                                      lock=self.lock,
+                                      trials=on_event is not None, hosts_model=self.hosts_model, max_rounds=escalation.ROUNDS,
+                                      brief=brief, label=label, **fix))
+        out = {**second, "escalated": True}
+        if first:
+            def key(o: dict):
+                clear = o.get("min_clearance_m")
+                return (agent.tier(o.get("kind"), o.get("edit")),
+                        not (clear is None or clear >= 2 * clearance - 1e-6),
+                        sum(abs(d) for d in o.get("delta_m") or []), -(clear or 1.0))
+            out["options"] = sorted([*first.get("options", []), *second["options"]], key=key)
+            out["attempts"] = [*first.get("attempts", []), *second["attempts"]]
+            out["understanding"] = second["understanding"] or first.get("understanding", "")
+            out["advice"] = second["advice"] or first.get("advice", "")
+        self._remember(scene_id, element_a, element_b, out, stamp)
+        return out
+
+    def fix_settings(self, scene_id: str, element_a: str, element_b: str) -> dict:
+        """What the coordination requirements set for a fix of this pair (none: today's defaults): the clearance it
+        must keep, who may be edited and how, the lines Muse Spark is told, and recommend-only when neither side
+        may be edited."""
+        doc = requirements.current()
+        if doc is None:
+            return {}
+        scene = self.scene(scene_id)
+        with self.lock:
+            m = requirements.Matcher(scene, doc)
+            pa, pb = requirements.policy(doc, m, element_a), requirements.policy(doc, m, element_b)
+            clearance = requirements.fix_clearance(doc, m, element_a, element_b)
+        why = None
+        if pa.edits == "none" and pb.edits == "none":
+            lv = requirements.LEVELS[doc.level]
+            why = (f"L{doc.level} {lv['name']}: report only" if requirements.resolve(doc).edits == "none" else
+                   f"neither {pa.group_name} nor {pb.group_name} may be edited")
+        return {"clearance_m": clearance, "policy": {element_a: pa, element_b: pb},
+                "guidance": requirements.prompt_text(doc, "fixes"), "recommend": why,
+                "doc": doc}
+
+    def clash_for(self, element_a: str, element_b: str, distance_m: float | None = None,
+                  images: list[str] | None = None, notes: str = "", report_id: str | None = None,
+                  clash_id: str | None = None, scene_id: str | None = None) -> agent.Clash:
+        pics = [Path(p) for p in images or []]
+        if report_id and clash_id:
+            c = self.report(report_id).clash(clash_id)
+            pics = pics or [p for _, p in c.images]
+            if distance_m is None:
+                distance_m = c.distance_m
+            source = (f"Found by ORCA's own detection: {c.test}, {c.name}." if self.report(report_id).origin == "sightline"
+                      else f"From a Navisworks clash report: {c.test}, {c.name}.")
+            seen = " Images are views of this clash." if pics else ""
+            notes = "\n".join(filter(None, [notes, source + seen]))
+            nearby = self._nearby(scene_id, self.report(report_id), element_a, element_b) if scene_id in self.scenes else {}
+            return agent.Clash(element_a, element_b, distance_m, pics, self._with_edits(notes, scene_id, element_a, element_b),
+                               nearby=nearby)
+        return agent.Clash(element_a, element_b, distance_m, pics, self._with_edits(notes, scene_id, element_a, element_b))
+
+    def _with_edits(self, notes: str, scene_id: str | None, element_a: str, element_b: str) -> str:
+        """The clash's notes, plus the edits already kept or undone on its elements (the edit log), so Muse builds on
+        them and does not propose an edit the person took back. Nothing when there are none."""
+        j = self.journals.get(scene_id or "")
+        if j is None:
+            return notes
+        touching = j.for_elements([element_a, element_b], kept_only=False)
+        if not touching:
+            return notes
+        lines = journal.entry_lines(touching, 4)
+        return "\n".join(filter(None, [notes, "Edits already made to these elements (newest last; [undone] were taken back): "
+                                        + " | ".join(lines)]))
+
+    NEARBY_M = 3.0   # how close another clash of the same element must be to be worth telling Muse about
+    NOT_PHYSICAL_CLASSES = {"IfcSpace", "IfcDistributionPort", "IfcOpeningElement", "IfcVirtualElement", "IfcZone"}
+    NEARBY_MAX = 3
+
+    def _nearby(self, scene_id: str, report, element_a: str, element_b: str) -> dict[str, list[str]]:
+        """Per side that can move, its other hard clashes in the report with physical partners, nearest first (at most
+        3, within 3 m of where A and B meet): one route may clear them together. Told to Muse, never required."""
+        def gap(x, y):
+            return float(np.linalg.norm(np.maximum(0, np.maximum(x[0] - y[1], y[0] - x[1]))))
+        scene = self.scenes[scene_id]
+        # Only partners of a side that can move: a girder's other services are its own clashes, not this fix's.
+        movable = {g for g in (element_a, element_b) if g in scene.bounds() and not scene.stays(g)}
+        found: dict[str, set[str]] = {}
+        for c in report.clashes:
+            ga, gb = c.a.global_id, c.b.global_id
+            if not ga or not gb or (c.distance_m is not None and c.distance_m > -0.001) or {ga, gb} == {element_a, element_b}:
+                continue
+            for mine, partner, cls in ((ga, gb, c.b.ifc_class), (gb, ga, c.a.ifc_class)):
+                if (mine in movable and partner not in (element_a, element_b)
+                        and cls not in self.NOT_PHYSICAL_CLASSES):
+                    found.setdefault(mine, set()).add(partner)
+        boxes = scene.bounds()
+        if not found or element_a not in boxes or element_b not in boxes:
+            return {}
+        # Where A and B meet: their boxes' overlap, or the gap between them on an axis where they do not overlap.
+        lo = np.maximum(boxes[element_a][0], boxes[element_b][0])
+        hi = np.minimum(boxes[element_a][1], boxes[element_b][1])
+        zone = np.array([np.minimum(lo, hi), np.maximum(lo, hi)])
+        out = {}
+        for mine, partners in found.items():
+            near = sorted((gap(boxes[p], zone), p) for p in partners if p in boxes)
+            kept = [p for dist, p in near if dist <= self.NEARBY_M][:self.NEARBY_MAX]
+            if kept:
+                out[mine] = kept
+        return out
+
+    def apply(self, scene_id: str, moved: list[str], delta_m: list[float], expect: dict | None = None) -> dict:
+        """Keep a move with its joints: what it takes along moves too and the segments it stretches change
+        (connections.plan_move, planned again here). With `expect` (the option's `edit`), a move whose plan has changed
+        since it was checked is refused."""
+        s = self.scene(scene_id)
+        with self.lock:
+            plan = connections.plan_move(s, moved, delta_m, refit=connections.refit_moves())
+            if not plan.ok:
+                raise edits.Unsupported(plan.refused)
+            if expect and expect.get("key") and expect["key"] != plan.key():
+                raise edits.Unsupported("the model changed since this move was checked: propose it again")
+            files = {s.index_of(g) for g in plan.changed()}
+            with edits.kept_files(s, files):
+                placements = connections.apply_move(s, plan)
+                broken = connections.check_joints(s, plan)
+                if broken:   # never kept: undone with the rest
+                    raise edits.Unsupported("a joint would not hold: " + "; ".join(w for *_, w in broken))
+            changed = plan.changed()   # with what its re-fits made: the page draws them
+            for g in changed:  # kept: export writes these files
+                s.mark_edited(g)
+            s.bump(files)
+        return {"placements": placements, "files": sorted(files), "changed": changed,
+                **({"joints": plan.edit(s, moved)} if not plan.plain else {})}
+
+    PATCH_MAX_VERTS = 500_000   # past this, the page reloads the files instead
+
+    def undo_edit(self, scene_id: str, entry_id: str | None = None) -> dict:
+        """Undo the newest kept edit in the log (journal.Fenced when it cannot be undone). What it made is gone again
+        (`removed`), what it changed or removed is back (`changed`)."""
+        s = self.scene(scene_id)
+        with self.lock:
+            e = self.journal(scene_id).undo(s, entry_id)
+            states = _manual().clash_states(s, self.journal(scene_id), e)
+        return {"entry": e.to_dict(), "files": e.files, "changed": [*e.elements, *e.removed], "removed": e.created,
+                "clash_states": states,
+                **self._journal_flags(scene_id)}
+
+    def redo_edit(self, scene_id: str, entry_id: str | None = None) -> dict:
+        s = self.scene(scene_id)
+        with self.lock:
+            e = self.journal(scene_id).redo(s, entry_id)
+            states = _manual().clash_states(s, self.journal(scene_id), e)
+        return {"entry": e.to_dict(), "files": e.files, "changed": [*e.elements, *e.created], "removed": e.removed,
+                "clash_states": states,
+                **self._journal_flags(scene_id)}
+
+    def _journal_flags(self, scene_id: str) -> dict:
+        j = self.journal(scene_id).summary()
+        return {k: j[k] for k in ("can_undo", "can_redo", "undo", "redo")}
+
+    def edits_csv(self, scene_id: str) -> str:
+        """The edit log as CSV, one row per entry (kept and undone), for a spreadsheet or an issue tracker."""
+        import csv
+        import io
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["id", "when", "source", "kind", "title", "summary", "clashes", "follows", "changed", "created",
+                    "removed", "warnings", "state"])
+        for e in self.journal(scene_id).entries:
+            d = e.to_dict()
+            w.writerow([e.id, d["when"], e.source, e.kind, e.title, e.summary,
+                        " ".join(str(c.get("id") or "/".join(c.get("pair") or [])) for c in e.clashes),
+                        " ".join(e.follows), " ".join(e.names.get(g, g) for g in e.elements),
+                        " ".join(e.names.get(g, g) for g in e.created), " ".join(e.names.get(g, g) for g in e.removed),
+                        "; ".join(w_["text"] for w_ in e.warnings), e.state])
+        return out.getvalue()
+
+    def patch(self, scene_id: str, changed: list[str], revision_before: int, removed: list[str] = ()) -> dict:
+        """What a page needs to update its model in place after a kept fix, instead of reloading whole files: the
+        scene's revision before and after the request, and the changed or new elements' triangles (`edits.meshes`,
+        render), taken after every edit of it. A page whose model is not at `revision_before` (it missed an edit), or
+        that gets no meshes (an element that would not triangulate, or too much to send), reloads the files."""
+        s = self.scene(scene_id)
+        gone = list(dict.fromkeys(removed))
+        out = {"scene_id": scene_id, "revision_before": revision_before, "revision": s.revision, "layout": s.layout,
+               "meshes": None,
+               # which files each revision changed: a page behind `revision_before` reloads what it missed
+               "history": [[rev, files] for rev, files in s.history], "removed": gone}
+        with self.lock:
+            # Openings and provisions are not drawn as elements: the host's new shape is what changes.
+            here = [g for g in dict.fromkeys(changed) if g not in gone and s.has(g) and not _void(s, g)]
+            try:
+                meshes = edits.meshes(s, here, render=True)
+            except (RuntimeError, KeyError):
+                return out
+        if sum(len(m["verts"]) for m in meshes) // 3 <= self.PATCH_MAX_VERTS:
+            out["meshes"] = meshes
+        return out
+
+    def check_offset(self, scene_id: str, element: str, other: str, split_m: list[float], dz_m: float,
+                     clearance_m: float | None = None) -> dict:
+        """Try a local offset of `element` around `other` without keeping it (see edits.py)."""
+        clearance_m = self.clearance(scene_id, element, other) if clearance_m is None else clearance_m
+        with self.lock:
+            attempt, option = agent._try_offset(self.scene(scene_id), {"split_m": split_m, "dz_m": dz_m}, element, other,
+                                                clearance_m)
+        return {"passed": attempt.passed, "reason": attempt.reason,
+                "min_clearance_m": option.min_clearance_m if option else None,
+                "preview": option.preview if option else None}
+
+    def apply_offset(self, scene_id: str, element: str, split_m: list[float], dz_m: float, bend_deg: float = 90.0) -> dict:
+        """Keep a local offset: the element is shortened and new pieces are added to its file (bends of `bend_deg`)."""
+        s = self.scene(scene_id)
+        with self.lock:
+            off = edits.apply_offset(s, element, split_m[0], split_m[1], dz_m, bend_deg=bend_deg)
+            s.mark_edited(element)
+            s.bump([s.index_of(element)])
+        return {**asdict(off), "files": [s.index_of(element)], "changed": list(off.pieces)}
+
+    def check_route(self, scene_id: str, element: str, other: str, steps: list[dict],
+                    clearance_m: float | None = None) -> dict:
+        """Try a route of `element` past `other` without keeping it (edits.apply_route)."""
+        clearance_m = self.clearance(scene_id, element, other) if clearance_m is None else clearance_m
+        with self.lock:
+            attempt, option = agent._try_route(self.scene(scene_id), {"steps": steps}, element, other, clearance_m)
+        return {"passed": attempt.passed, "reason": attempt.reason, "kind": attempt.kind,
+                "summary": (attempt.edit or {}).get("summary"),
+                "min_clearance_m": option.min_clearance_m if option else None,
+                "preview": option.preview if option else None}
+
+    def apply_route(self, scene_id: str, element: str, steps: list[dict]) -> dict:
+        """Keep a route: the element is shortened and its detour pieces are added to its file."""
+        s = self.scene(scene_id)
+        with self.lock:
+            r = edits.apply_route(s, element, steps)
+            s.mark_edited(element)
+            s.bump([s.index_of(element)])
+        return {**asdict(r), "files": [s.index_of(element)], "changed": list(r.pieces)}
+
+    def apply_combined(self, scene_id: str, steps: list[dict], element_a: str, element_b: str) -> dict:
+        """Keep a combined fix (agent._try_combined): its steps are checked again as Muse would propose them (each on
+        its own element, none fixed or forbidden by the requirements, one on A or B), then made for good. Raises
+        `agent.Refused` with why."""
+        s = self.scene(scene_id)
+        with self.lock:
+            checked = agent.combined_steps(s, {"steps": [agent.step_candidate(st) for st in steps]}, element_a, element_b)
+            files = sorted({s.index_of(g) for st in checked for g in st["moved"]})
+            with edits.kept_files(s, set(files)):   # all the steps or none: a step that fails undoes the others
+                made = agent.apply_combined(s, checked)
+            for st in checked:
+                for g in st["moved"]:
+                    s.mark_edited(g)
+            s.bump(files)
+        # Pieces per split run, the original first (a moved run has none: it is the same elements, elsewhere).
+        return {"files": files, "changed": [g for _, els in made for g in els],
+                "pieces": [els for st, els in made if st["kind"] != "move"]}
+
+    def check_resize(self, scene_id: str, element: str, other: str, split_m: list[float], depth_m: float,
+                     keep: str = "bottom", clearance_m: float | None = None) -> dict:
+        """Try a flatter section for a stretch of `element` past `other` without keeping it (edits.apply_resize)."""
+        clearance_m = self.clearance(scene_id, element, other) if clearance_m is None else clearance_m
+        with self.lock:
+            attempt, option = agent._try_resize(self.scene(scene_id), {"split_m": split_m, "depth_m": depth_m, "keep": keep},
+                                                element, other, clearance_m)
+        return {"passed": attempt.passed, "reason": attempt.reason, "kind": attempt.kind,
+                "summary": (attempt.edit or {}).get("summary"), "performance": (attempt.edit or {}).get("performance"),
+                "min_clearance_m": option.min_clearance_m if option else None,
+                "preview": option.preview if option else None}
+
+    def apply_resize(self, scene_id: str, element: str, split_m: list[float], depth_m: float, keep: str = "bottom") -> dict:
+        """Keep a resize: the element is shortened and its transitions and resized middle are added to its file."""
+        s = self.scene(scene_id)
+        with self.lock:
+            r = edits.apply_resize(s, element, split_m, depth_m, keep)
+            s.mark_edited(element)
+            s.bump([s.index_of(element)])
+        return {**asdict(r), "files": [s.index_of(element)], "changed": list(r.pieces)}
+
+    def check_penetration(self, scene_id: str, service: str, host: str, clearance_m: float | None = None) -> dict:
+        """Try an opening for `service` through `host` without keeping it (edits.penetration), after reading what may
+        be done to that kind of host (hosts.read)."""
+        s = self.scene(scene_id)
+        clearance_m = self.clearance(scene_id, service, host) if clearance_m is None else clearance_m
+        with self.lock:
+            prof = None if hosts.hard_rule(s, host) else hosts.profile(s, host)
+        model = self.hosts_model if prof else None
+        if model is not None:
+            try:
+                hosts.read(model, [prof])
+            except Exception:
+                pass   # the defaults: walls and slabs only
+        with self.lock:
+            attempt, option = agent._try_penetration(s, {}, service, host, clearance_m)
+            reading = hosts.decide(s, host, requirements.current())
+        return {"passed": attempt.passed, "reason": attempt.reason, "kind": attempt.kind,
+                "summary": (attempt.edit or {}).get("summary"), "review": option.review if option else None,
+                "host": hosts.reading_text(reading), "numbers": (attempt.edit or {}).get("numbers"),
+                "min_clearance_m": option.min_clearance_m if option else None,
+                "preview": option.preview if option else None}
+
+    def apply_penetration(self, scene_id: str, service: str, host: str) -> dict:
+        """Keep a penetration request: a provision for void in the service's model, always; the opening cut in the
+        host only when the coordination requirements let its team's model be edited (none: it is cut). Sized again
+        here with the clearance the requirements ask for. Not cut, the clash stays open: `cut` False and `blocked_by`
+        say who cuts it."""
+        s = self.scene(scene_id)
+        settings = self.fix_settings(scene_id, service, host)
+        host_policy = (settings.get("policy") or {}).get(host)
+        cut = requirements.can_cut(host_policy)
+        with self.lock:
+            reading = hosts.decide(s, host, settings.get("doc"))
+            if reading.refuses:
+                raise edits.Unsupported(f"{s.element(host).name} may not take an opening: "
+                                        f"{reading.reasoning or hosts.reading_text(reading)}")
+            pen = edits.penetration(s, service, host, settings.get("clearance_m", requirements.DEFAULT_CLEARANCE_M), reading.fit)
+            problems, _ = hosts.check_hole(s, pen, reading)
+            if problems:   # the limits as they are now (the requirements may have changed since it was proposed)
+                raise edits.Unsupported("; ".join(problems))
+            edits.apply_penetration(s, pen, cut)
+            s.mark_edited(service)
+            if cut:
+                s.mark_edited(host)
+            files = sorted({s.index_of(service), *([s.index_of(host)] if cut else [])})
+            s.bump(files)
+        out = {**asdict(pen), "cut": cut, "files": files, "changed": [pen.provision, *([host] if cut else [])]}
+        if not cut:
+            out["blocked_by"] = f"{host_policy.group_name} may not be edited: its team cuts the opening"
+        return out
+
+    def check_seat(self, scene_id: str, element: str, support: str, clearance_m: float | None = None) -> dict:
+        """Try seating `element` on `support` without keeping it (edits.seat): cut where it is inside the support below
+        its top, so it bears on it."""
+        clearance_m = self.clearance(scene_id, element, support) if clearance_m is None else clearance_m
+        with self.lock:
+            attempt, option = agent._try_seat(self.scene(scene_id), {}, element, support, clearance_m)
+        return {"passed": attempt.passed, "reason": attempt.reason, "kind": attempt.kind,
+                "summary": (attempt.edit or {}).get("summary"), "review": option.review if option else None,
+                "min_clearance_m": option.min_clearance_m if option else None,
+                "preview": option.preview if option else None}
+
+    def apply_seat(self, scene_id: str, element: str, support: str) -> dict:
+        """Keep a seat: a recess in `element` where it is inside `support` below its top (edits.apply_seat), measured
+        again on the model as it is now."""
+        s = self.scene(scene_id)
+        with self.lock:
+            st = edits.apply_seat(s, agent.seat_of(s, element, support))
+            s.mark_edited(element)
+            s.bump([s.index_of(element)])
+        return {**asdict(st), "pieces": [element], "files": [s.index_of(element)], "changed": [element]}
+
+    def apply_trim(self, scene_id: str, element: str, end: str, by_m: float) -> dict:
+        """Keep a trim: the element's end is cut back (see edits.apply_trim)."""
+        s = self.scene(scene_id)
+        with self.lock:
+            t = edits.apply_trim(s, element, end, by_m)
+            s.mark_edited(element)
+            s.bump([s.index_of(element)])
+        return {**asdict(t), "pieces": [element], "files": [s.index_of(element)], "changed": [element]}
+
+    def file(self, scene_id: str, index: int, out_dir: Path) -> Path:
+        """A model file as it is now: the original on disk, or the edited model written out."""
+        with self.lock:
+            s = self.scene(scene_id)
+            if index not in s._edited:
+                return s.paths[index]
+            path = out_dir / f"{scene_id}-{index}-{s.paths[index].name}"
+            s.models[index].write(str(path))
+            return path
+
+    def export(self, scene_id: str, out_dir: Path) -> list[Path]:
+        """Write the edited files only; untouched discipline models are not rewritten. A model that came from STEP is
+        also written back as STEP, each moved part translated in the original file (`step.export`)."""
+        with self.lock:
+            s = self.scene(scene_id)
+            j = self.journals.get(scene_id)
+            # Each edited element names the log's entries that made it so (ORCA_Edit), written with the files only:
+            # inside a transaction undone after, so the log's own undo stays as it was.
+            with edits.scratch(s, set(s._edited)):
+                if j is not None:
+                    _stamp_edits(s, j)
+                out = s.write_edited(out_dir)
+            for i in sorted(s._edited):
+                src = self.sources.get(scene_id, {}).get(i)
+                if not src:
+                    continue
+                parts = json.loads(Path(src["manifest"]).read_text())["parts"]
+                moves, replace, add = step_changes(s, i, parts, reshaped(j))
+                stem = Path(src["step"]).stem
+                out.append(step.export(Path(src["step"]), parts, out_dir / f"{stem}.orca.step", moves, replace, add,
+                                       step_removed(s, i, parts)))
+            if j is not None and j.kept() and len(out) > 1:   # a zip: the log beside the models
+                (out_dir / "orca-edits.json").write_text(json.dumps([e.to_dict() for e in j.entries], indent=1, default=str),
+                                                         encoding="utf-8")
+                # UTF-8 on every host (names carry arrows and dashes); the CSV's own line ends, not the platform's
+                (out_dir / "orca-edits.csv").write_text(self.edits_csv(scene_id), encoding="utf-8", newline="")
+                out += [out_dir / "orca-edits.json", out_dir / "orca-edits.csv"]
+            return out
+
+    # Clash reports (Navisworks XML).
+
+    @property
+    def report_samples_dir(self) -> Path:
+        return self.samples / "reports"
+
+    def list_report_samples(self) -> list[str]:
+        """Folders under samples/reports/ with an XML report at their top level."""
+        root = self.report_samples_dir
+        return sorted(d.name for d in root.iterdir() if d.is_dir() and any(d.glob("*.xml"))) if root.is_dir() else []
+
+    def open_report_sample(self, name: str) -> reports.Report:
+        root = (self.report_samples_dir / name).resolve()
+        if root.parent != self.report_samples_dir.resolve() or not root.is_dir():
+            raise FileNotFoundError(name)
+        return self._keep(reports.load(uuid.uuid4().hex[:12], root, list(root.glob("*.xml")), name,
+                                       exclude=SAMPLE_EXCLUDE))
+
+    def open_report_folder(self, root: Path, title: str) -> reports.Report:
+        """An uploaded folder: every XML in it, at any depth. The folder is deleted when the report is dropped."""
+        try:
+            report = reports.load(uuid.uuid4().hex[:12], root, list(root.rglob("*.xml")), title, temporary=True)
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        return self._keep(report)
+
+    def _oldest(self, held: dict, newest: str) -> str:
+        """The one to drop: the oldest that no live agent link points at (nor, for reports, is a scene's open list of
+        checks), else the oldest (never the one just added)."""
+        kept = self.keep() | {r.report_id for r in self.checks.values() if r.report_id}
+        ids = [k for k in held if k != newest]
+        return next((k for k in ids if k not in kept), ids[0])
+
+    def _keep(self, report: reports.Report) -> reports.Report:
+        self.reports[report.id] = report
+        while self.max_reports and len(self.reports) > self.max_reports:
+            self._drop_report(self._oldest(self.reports, report.id))
+        return report
+
+    def _drop_report(self, report_id: str) -> None:
+        old = self.reports.pop(report_id, None)
+        for key in [k for k in self._matches if k[0] == report_id]:
+            self._matches.pop(key, None)
+        if old is not None and old.temporary:
+            shutil.rmtree(old.root, ignore_errors=True)
+
+    def report(self, report_id: str) -> reports.Report:
+        return self.reports[report_id]
+
+    def report_summary(self, report_id: str) -> dict:
+        r = self.report(report_id)
+        out = {
+            "id": r.id, "title": r.title, "sources": r.sources, "origin": r.origin,
+            "requirements_id": r.requirements_id,
+            "clashes": [{**{k: v for k, v in asdict(c).items() if k != "images"},
+                         "images": [label for label, _ in c.images]} for c in r.clashes],
+        }
+        if r.scene_id is not None:   # ORCA's checks: the scene, which union this is, and the checks it holds
+            scene = self.scenes.get(r.scene_id)
+            rev = scene.revision if scene is not None else None
+            out |= {"scene_id": r.scene_id, "serial": r.serial,
+                    "checks": [{**c, "stale": rev is not None and c["revision"] < rev} for c in r.checks]}
+        return out
+
+    # ORCA detection (detect.py; design in docs/detection.md).
+
+    def detect_tests(self, scene_id: str) -> dict:
+        """The tests a run would use by default for the open models, and the ones offered but off. Under coordination
+        requirements (requirements.current()), the tests they compile to."""
+        scene = self.scene(scene_id)
+        doc = requirements.current()
+        with self.lock:
+            ix = detect._Index(scene)
+            tests = (requirements.compile_tests(doc, scene) if doc else
+                     detect.default_tests(scene, ix) + detect.presets(scene, ix))
+            teams = {name: team for name, team in zip(ix.names, ix.teams)}
+            per_file = Counter(ix.names[i] for i in ix.file.values())
+            everything = detect.everything(scene, ix)
+        return {"tests": [asdict(t) for t in tests], "teams": teams, "elements": len(ix.entity), "file_elements": dict(per_file),
+                "rules": detect.RULE_LABEL, "requirements": self.requirements_info(doc),
+                "check": self._check_defaults(scene_id, tests, everything)}
+
+    def check_defaults(self, scene_id: str) -> dict:
+        """What a check on filters takes when it says nothing else (docs/filters.md, "Checks"): the hard tolerance,
+        rules and smallest size of the tests a run would use (the requirements', under requirements), and the clearance
+        the requirements ask for."""
+        scene = self.scene(scene_id)
+        doc = requirements.current()
+        with self.lock:
+            ix = detect._Index(scene)
+            tests = requirements.compile_tests(doc, scene) if doc else detect.default_tests(scene, ix)
+            everything = detect.everything(scene, ix)
+        return self._check_defaults(scene_id, tests, everything)
+
+    def _check_defaults(self, scene_id: str, tests: list, everything: "detect.Selection | None" = None) -> dict:
+        """`everything`: what a check's Everything takes, the models the full check covers (a site model left out)."""
+        hard = next((t for t in tests if t.kind == "hard" and t.enabled), None)
+        return {"tolerance_m": hard.tolerance_m if hard else detect.TOLERANCE_M, "clearance_m": self.clearance(scene_id),
+                "rules": dict(hard.rules) if hard else {r: True for r in detect.RULES},
+                "min_size_m": hard.min_size_m if hard else 0.0,
+                "everything": asdict(everything if everything is not None else detect.Selection())}
+
+    @staticmethod
+    def requirements_info(doc=None) -> dict | None:
+        """What a result was checked against: the file's name, version, level and strictness, and its id."""
+        doc = doc if doc is not None else requirements.current()
+        if doc is None:
+            return None
+        return {"id": requirements.doc_id(doc), "name": doc.name, "version": doc.version, "label": requirements.label(doc),
+                "level": doc.level, "strictness": doc.strictness}
+
+    def detect(self, scene_id: str, tests: list[dict] | None = None, on_event=None, check: str | None = None) -> dict:
+        """Run ORCA's own clash detection as a check, keep its result with the scene's other checks, and open every kept
+        check's clashes as one clash report (checks.py). `tests` None: the open models, by the defaults or the
+        requirements'. `check`: a kept check's key, run again with the tests it ran with."""
+        scene = self.scene(scene_id)
+        doc = requirements.current()
+        with self.lock:
+            register = self._register(scene_id)
+            if check is not None:
+                kept = register.checks.get(check)
+                if kept is None:
+                    raise KeyError(check)
+                tests = kept.tests
+            key, run, chosen = self._run_check(scene_id, register, tests, doc, on_event)
+            report = self._union(scene_id)
+            revision = scene.revision
+        return {"report": self.report_summary(report.id), "check": key, "ran": [key],
+                "checks": register.summaries(revision), "coverage": [asdict(c) for c in run.coverage],
+                "diff": run.diff, "elements": run.elements, "seconds": run.seconds, "offset": run.offset,
+                "requirements": self.requirements_info(doc),
+                # The tests as run, when they were chosen (a check on filters), so the check can be run again; None:
+                # the defaults (or the requirements'), read afresh next time.
+                "tests": None if tests is None else [asdict(t) for t in chosen]}
+
+    def detect_all(self, scene_id: str, on_event=None) -> dict:
+        """Run every kept check again, one after another (the open models first), and open them as one clash report.
+        Each check takes the lock on its own, so a proposal waits for one check, not all of them. With none kept: the
+        open models."""
+        emit = on_event or (lambda e: None)
+        scene = self.scene(scene_id)
+        register = self.checks.get(scene_id)
+        keys = list(register.checks) if register is not None else []
+        if not keys:
+            return self.detect(scene_id, None, on_event)
+        doc = requirements.current()
+        ran, seconds = [], 0.0
+        for n, key in enumerate(keys):
+            with self.lock:
+                kept = register.checks.get(key)
+                if kept is None:   # removed meanwhile
+                    continue
+                emit({"type": "check", "key": key, "name": kept.name, "index": n, "of": len(keys)})
+                _, run, _ = self._run_check(scene_id, register, kept.tests, doc, on_event, key=key)
+                ran.append(key)
+                seconds += run.seconds
+        with self.lock:
+            report = self._union(scene_id)
+            revision = scene.revision
+        summaries = register.summaries(revision)
+        return {"report": self.report_summary(report.id), "check": None, "ran": ran, "checks": summaries,
+                "coverage": [c for s in summaries for c in s["coverage"]], "diff": None,
+                "elements": max([s["elements"] for s in summaries] or [0]), "seconds": round(seconds, 2),
+                "offset": None, "requirements": self.requirements_info(doc), "tests": None}
+
+    def _register(self, scene_id: str) -> checks.Register:
+        register = self.checks.get(scene_id)
+        if register is None:
+            register = self.checks[scene_id] = checks.Register()
+        return register
+
+    def _run_check(self, scene_id: str, register: checks.Register, tests: list[dict] | None, doc, on_event,
+                   key: str | None = None):
+        """One check's run, kept in the register (the caller holds the lock): its key, the run and the tests it ran."""
+        scene = self.scene(scene_id)
+        if tests is not None:
+            chosen = [detect.Test.from_dict(t) for t in tests]
+        else:
+            chosen = requirements.compile_tests(doc, scene) if doc else None
+        key = key or checks.key_of(chosen)
+        # A check compares with its own last run, and only under the same requirements (the same tests).
+        rid = requirements.doc_id(doc) if doc else None
+        register.absorb(self.reports.get(register.report_id or ""))
+        run = detect.run(scene, chosen, on_event=on_event, previous=register.previous(key, rid),
+                         known=register.known(), root=register.root)
+        run.report.requirements_id = rid
+        register.keep(key, run, None if tests is None else [asdict(t) for t in chosen], self.requirements_info(doc),
+                      scene.revision)
+        return key, run, chosen
+
+    def _union(self, scene_id: str) -> reports.Report | None:
+        """The scene's kept checks as one new clash report (None when none is kept); the older unions go, but the
+        last one a page or link may still be on."""
+        register = self.checks[scene_id]
+        report = register.union(uuid.uuid4().hex[:12], self.names.get(scene_id, []), scene_id,
+                                self.scene(scene_id).revision)
+        if report is None:
+            register.report_id = None
+            return None
+        self._keep(report)
+        kept = self.keep()
+        while len(register.unions) > checks.UNIONS_KEPT:
+            old = register.unions.pop(0)
+            if old not in kept:
+                self._drop_report(old)
+        return report
+
+    def union_report(self, scene_id: str) -> reports.Report | None:
+        """The scene's open list of checks, made again (with a new id) if the server let its report go."""
+        register = self.checks.get(scene_id)
+        if register is None or not register.checks:
+            return None
+        with self.lock:
+            if register.report_id in self.reports:
+                return self.reports[register.report_id]
+            return self._union(scene_id)
+
+    def checks_info(self, scene_id: str) -> dict:
+        """The scene's kept checks and the report that lists their clashes."""
+        report = self.union_report(scene_id)
+        register = self.checks.get(scene_id)
+        return {"report_id": report.id if report is not None else None,
+                "checks": register.summaries(self.scene(scene_id).revision) if register is not None else []}
+
+    def remove_check(self, scene_id: str, key: str) -> dict:
+        """Drop a check on filters and open what is left (KeyError: no such check; ValueError: the open models)."""
+        self.scene(scene_id)
+        with self.lock:
+            register = self.checks.get(scene_id)
+            if register is None:
+                raise KeyError(key)
+            register.absorb(self.reports.get(register.report_id or ""))
+            register.remove(key)
+            report = self._union(scene_id)
+            revision = self.scene(scene_id).revision
+        return {"report": self.report_summary(report.id) if report is not None else None,
+                "checks": register.summaries(revision)}
+
+    def scene_info(self, scene_id: str) -> dict:
+        """What a page needs to reopen a scene it had open (a reload, a closed tab): its files as they were opened,
+        which came from STEP, its kept checks and the report that lists their clashes."""
+        self.scene(scene_id)
+        return {"id": scene_id, "files": self.names.get(scene_id, []), "step": self.step_files(scene_id),
+                "revision": self.scene(scene_id).revision, "layout": self.scene(scene_id).layout,
+                **self.checks_info(scene_id)}
+
+    def save_capture(self, report_id: str, clash_id: str, label: str, png: bytes) -> list[str]:
+        """A view of a detected clash taken in the browser (A, B or C). It joins the clash's images, so the fix agent,
+        triage and the PDF see it as they see Navisworks views. Only detected reports take captures; they are kept with
+        the scene's checks, so every later list of its clashes has them too."""
+        report = self.report(report_id)
+        if report.origin != "sightline":
+            raise PermissionError("Only clashes found by ORCA take captured views.")
+        if label not in ("A", "B", "C"):
+            raise ValueError("label must be A, B or C")
+        clash = report.clash(clash_id)
+        register = self.checks.get(report.scene_id or "")
+        if register is None:
+            raise PermissionError("These models are no longer open here: open them again to take views.")
+        register.save_view(clash.id, label, png)
+        clash.images = register.images(clash.id)
+        current = self.reports.get(register.report_id or "")
+        if current is not None and current is not report:
+            same = next((c for c in current.clashes if c.id == clash.id), None)
+            if same is not None:
+                same.images = register.images(clash.id)
+        return [k for k, _ in clash.images]
+
+    def report_image(self, report_id: str, clash_id: str, index: int) -> Path:
+        return self.report(report_id).clash(clash_id).images[index][1]
+
+    def match(self, report_id: str, scene_id: str) -> dict[str, dict]:
+        """Which model element each clash side is: by GlobalId, else by a unique IFC class + name.
+        Covers every product (spaces and ports too), not only the physical ones the geometry check uses."""
+        key = (report_id, scene_id)
+        if key in self._matches:
+            return self._matches[key]
+        scene = self.scene(scene_id)
+        by_name: dict[tuple[str, str], list[str]] = {}
+        known: set[str] = set()
+        for model in scene.models:
+            for p in model.by_type("IfcProduct"):
+                known.add(p.GlobalId)
+                by_name.setdefault((p.is_a(), p.Name or ""), []).append(p.GlobalId)
+
+        def find(e: reports.ReportElement) -> tuple[str | None, str | None]:
+            if e.global_id and e.global_id in known:
+                return e.global_id, "globalid"
+            hits = by_name.get((e.ifc_class or "", e.name), [])
+            return (hits[0], "name") if len(hits) == 1 else (None, None)
+
+        def shown(gid: str | None) -> str | None:
+            """What the viewer can draw for a matched element: a port has no body, so its pipe or valve."""
+            if gid is None:
+                return None
+            e = scene.entity(gid)
+            if e.is_a("IfcDistributionPort") or e.is_a("IfcPort"):
+                owner = ifcopenshell.util.system.get_port_element(e)
+                return owner.GlobalId if owner is not None else None
+            return gid
+
+        out = {}
+        for c in self.report(report_id).clashes:
+            (a, how_a), (b, how_b) = find(c.a), find(c.b)
+            out[c.id] = {"a": a, "b": b, "how": [how_a, how_b], "show": [shown(a), shown(b)]}
+        self._matches[key] = out
+        return out
+
+    def measure(self, report_id: str, clash_id: str, scene_id: str) -> dict:
+        """ORCA's own measure of a report clash: the signed distance between the two matched elements.
+        None when they do not overlap here, or when they are joined through ports (the check skips those)."""
+        with self.lock:
+            m = self.match(report_id, scene_id)[clash_id]
+            if not (m["a"] and m["b"]):
+                return {"matched": False, "physical": None, "distance_m": None}
+            scene = self.scene(scene_id)
+            physical = scene.bounds().keys()
+            if m["a"] not in physical or m["b"] not in physical:
+                return {"matched": True, "physical": False, "distance_m": None}
+            if self.report(report_id).origin == "sightline":  # the same measure the run used, so the two agree
+                return {"matched": True, "physical": True, "distance_m": detect.measure_pair(scene, m["a"], m["b"])}
+            v = verify.check(scene, [m["a"]], clearance_m=0.0)
+            hit = next((h for h in v.hits if h.other == m["b"]), None)
+            return {"matched": True, "physical": True, "distance_m": hit.distance_m if hit else None}
+
+
+def _mb(size: int) -> str:
+    return f"{size / (1 << 20):.0f} MB" if size >= 10 << 20 else f"{size / (1 << 20):.1f} MB"
+
+
+def project_name(files: list[str]) -> str | None:
+    """The project a set of model files belongs to: their shared prefix ("Northbank-MEP.ifc", "Northbank-Site.ifc" →
+    "Northbank"), or the one file's own name; None when they share none. The page's `projectName` (About.tsx), less its
+    "first file + n more" fallback, which is no name for a download."""
+    names = [re.sub(r"\.(ifc|step|stp)$", "", f, flags=re.IGNORECASE) for f in files]
+    if len(names) <= 1:
+        return names[0] if names and names[0] else None
+    prefix = names[0]
+    for n in names[1:]:
+        while not n.startswith(prefix):
+            prefix = prefix[:-1]
+    m = re.match(r"^(.*[A-Za-z0-9])[\s_.-]", prefix)
+    cut = m.group(1) if m else prefix if all(n == prefix for n in names) else ""
+    return cut if len(cut) >= 3 else None
+
+
+EDIT_PSET = "ORCA_Edit"
+
+
+def _stamp_edits(scene: IfcScene, log) -> None:
+    """An ORCA_Edit property set on every element the kept edits changed or made: which entries (E1, E2), what they
+    did, who kept them, when, and the clashes they were for. Read by anyone who opens the exported IFC."""
+    by_element: dict[str, list] = {}
+    for e in log.kept():
+        for gid in [*e.elements, *e.created]:
+            by_element.setdefault(gid, []).append(e)
+    for gid, entries in by_element.items():
+        try:
+            element = scene.entity(gid)
+        except KeyError:
+            continue
+        i = scene.index_of(gid)
+        if i not in scene._edited:
+            continue
+        model = scene.models[i]
+        ids = [c.get("id") for x in entries for c in x.clashes if c.get("id")]
+        pset = ifcopenshell.api.run("pset.add_pset", model, product=element, name=EDIT_PSET)
+        ifcopenshell.api.run("pset.edit_pset", model, pset=pset, properties={
+            "EntryIds": ", ".join(x.id for x in entries),
+            "Ops": ", ".join(dict.fromkeys(x.kind for x in entries)),
+            "Summary": " | ".join(x.summary or x.title for x in entries)[:2000],
+            "Source": ", ".join(dict.fromkeys(x.source for x in entries)),
+            "When": ", ".join(x.to_dict()["when"] for x in entries),
+            "Clashes": ", ".join(dict.fromkeys(str(c) for c in ids)) or "",
+        })
+
+
+def _void(scene: IfcScene, gid: str) -> bool:
+    return scene.entity(gid).is_a("IfcFeatureElement")
+
+
+
+def _spec(scene: IfcScene, element) -> dict:
+    """An element's body for `step.export`, in metres and world axes: its extrusion when it is one, else its mesh."""
+    try:
+        _, _, item, origin, d, px, _ = edits._frames(scene, element)
+        k = scene.unit_scales[scene.index_of(element.GlobalId)]
+        area = item.SweptArea
+        if area.is_a("IfcCircleProfileDef"):
+            profile = ("circle", area.Radius * k)
+        elif area.is_a("IfcRectangleProfileDef"):
+            profile = ("rect", area.XDim * k, area.YDim * k)
+        else:
+            raise edits.Unsupported(area.is_a())
+        return {"kind": "prism", "profile": profile, "start": (np.asarray(origin) * k).tolist(),
+                "axis": np.asarray(d).tolist(), "xdir": np.asarray(px).tolist(), "depth": item.Depth * k}
+    except edits.Unsupported:
+        settings = ifcopenshell.geom.settings()
+        settings.set("use-world-coords", True)
+        geom = ifcopenshell.geom.create_shape(settings, element).geometry
+        return {"kind": "mesh", "verts": np.asarray(geom.verts, float).reshape(-1, 3).tolist(),
+                "faces": np.asarray(geom.faces, int).reshape(-1, 3).tolist()}
+
+
+def _manual():
+    from . import manual   # manual reads the scene's services; imported when first needed
+    return manual
+
+
+def step_removed(scene: IfcScene, index: int, parts: dict) -> list[str]:
+    """The STEP parts no longer in the model (a hand edit deleted them): `step.export` takes them out."""
+    model, gone = scene.models[index], []
+    for gid in parts:
+        try:
+            model.by_guid(gid)
+        except RuntimeError:
+            gone.append(gid)
+    return gone
+
+
+RESHAPES = {"push_pull", "clip", "void", "cut_by", "split", "remove_section", "offset", "join"}   # hand edits that change a body's shape
+
+
+def reshaped(journal) -> set[str]:
+    """Elements a kept hand edit gave a new shape (not only a new place): a pushed face, a clip, a cut, a split."""
+    out: set[str] = set()
+    for e in (journal.kept() if journal is not None else []):
+        if e.kind in RESHAPES or (e.kind == "align" and (e.params or {}).get("how") != "move"):
+            out |= set(e.elements)
+    return out
+
+
+def step_changes(scene: IfcScene, index: int, parts: dict, reshaped: set[str] = frozenset()) -> tuple[dict, dict, list]:
+    """What changed in a model converted from STEP, for `step.export`: moved parts (placement against the manifest's
+    origin), parts whose extrusion changed (an offset's first piece, a trimmed member), that were cut for a service or
+    that a hand edit reshaped (`reshaped`: a mesh's face pushed, a clip), and new parts (the rest of an offset, a
+    provision for void, a split's second piece), each new part tied to the STEP part it came from through its
+    `ORCA_STEP` label."""
+    model = scene.models[index]
+    moves, replace, add = {}, {}, []
+    for gid, info in parts.items():
+        try:
+            element = model.by_guid(gid)
+        except RuntimeError:
+            continue
+        delta = np.asarray(scene.placement(gid)[:3, 3]) - np.asarray(info["origin"])
+        voids = [r.RelatedOpeningElement for r in getattr(element, "HasOpenings", None) or []]
+        if voids:   # cut for a service (a STEP part never had openings of its own)
+            replace[gid] = {"kind": "cut", "base": _spec(scene, element), "tools": [_spec(scene, o) for o in voids]}
+            continue
+        prism = info.get("prism")
+        if prism:
+            now = _spec(scene, element)
+            moved_start = np.asarray(prism["start"]) + delta
+            if now["kind"] != "prism" or abs(now["depth"] - prism["depth"]) > 1e-6 \
+                    or np.linalg.norm(np.asarray(now["start"]) - moved_start) > 1e-6 \
+                    or now["profile"][0] != prism["profile"][0] \
+                    or not np.allclose(now["profile"][1:], list(prism["profile"])[1:], atol=1e-6):   # a side pushed, a radius
+                replace[gid] = now
+                continue
+        if gid in reshaped:   # its shape as it is now (a mesh), in place of the STEP part's
+            replace[gid] = _spec(scene, element)
+            continue
+        if np.any(np.abs(delta) > 1e-6):
+            moves[gid] = delta.tolist()
+    known = set(parts)
+    for element in model.by_type("IfcElement"):
+        if element.GlobalId in known or element.Representation is None or element.is_a("IfcFeatureElement"):
+            continue
+        source = step_source(element)
+        if source.get("Label"):
+            add.append({"name": element.Name or element.is_a()[3:], "label": source["Label"],
+                        "spec": _spec(scene, element),
+                        **({"colour": edits.PFV_COLOUR, "alpha": edits.PFV_ALPHA} if is_provision(element) else {})})
+    return moves, replace, add

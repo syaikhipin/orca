@@ -1,0 +1,248 @@
+# ORCA: agent guide
+
+ORCA (Observe · Resolve · Check · Apply): an agent that resolves spatial conflicts in 3D models, proven on buildings
+and machines. A standalone web app built by IssueLab for the Meta Global AI Developer Hackathon, Startup track. Building period Oct 27 – Nov 4,
+2026, 9:00 PM ET; submissions need this public repo, a 3-minute demo video, and only work built during the event.
+
+## What it does
+
+1. **Understand** a clash from images (A/B/C, below) plus model data, with Muse Spark.
+2. **Propose** 1–3 fixes by editing real IFC elements, each **verified** by geometry (clash gone, clearance met,
+   nothing new hit) before the user sees it. Loop: propose → verify → retry with the failure reason → rank.
+3. **Review** in 3D in the browser (before/after, options 1–3), accept, export the edited IFC (+ BCF, planned).
+4. **Voice** control (Muse Voice Transcribe) if time allows.
+
+The headline is verified model edits. Image-only explanation is a fallback, never the pitch: "simple image
+analyzers", dashboards-as-main-feature and Streamlit apps are on the hackathon's anti-project list.
+
+## Rules
+
+- **Only new work in the demo.** Everything here was written from Oct 27. If any code is ever adapted from earlier
+  IssueLab work, list it in BUILT_DURING_HACKATHON.md before committing it. No customer data, ever.
+- **The product is ORCA, by IssueLab** (renamed from Sightline on Oct 29, owner decision). It has no association with
+  any other IssueLab product: don't name one in the app, docs or commits.
+- **Commits are authored by Dodzi Agbenorku with the GitHub noreply address** (repo git config). No co-author or
+  session trailers. Never commit a personal email.
+- **Secrets never enter git or chat.** `META_API_KEY` comes from `.env` (gitignored) or the environment. The browser
+  never sees it; only the Python server calls Meta.
+- **No "Meta" or "Muse" in the product name.**
+- **Keep `docs/architecture/` current.** A core change updates its doc in the same PR ("Keep the docs current",
+  below).
+
+## Stack and why
+
+- Web: Vite + TypeScript + React; desktop panels on dockview (free MIT core only, never `dockview-enterprise`);
+  viewer built on three.js + web-ifc, **no That Open** (three-mesh-bvh is declared
+  in `package.json` but nothing imports it). Each IFC file is one `BatchedMesh` (per-element
+  transform/colour/visibility, so a preview is one matrix update).
+  `COORDINATE_TO_ORIGIN` is off: federated files share coordinates.
+- Server: Python 3.13 + FastAPI + IfcOpenShell 0.9 (the demo models pin 0.8.5; keep an eye on drift).
+  MCP server over the same operations (`server/sightline/service.py` is shared by API and MCP).
+- Not Blazor: Telerik is commercial with a private feed (public repo must build for anyone), JS↔.NET interop on
+  every viewer event, slow WASM start for judges.
+- Meta: OpenAI-style chat completions at `https://api.meta.ai/v1` (confirmed: `/v1/...` answers 401 without a key,
+  `/chat/completions` 404), model `muse-spark-1.3-contributor`. Open-weights host for bulk triage: Baseten
+  `meta-models/muse-spark-open` (confirmed Oct 27 by `/v1/models` and a call; `-1026` 404s; key `BASETEN_API_KEY` in the environment).
+
+## Geometry facts learned the hard way
+
+- Units: placements/moves/clearances are always **metres**; `IfcScene` converts per file. `edit_object_placement`
+  takes SI with `is_si=True`; `add_profile_representation(depth=)` takes SI too.
+- Clash tree: use `ifcopenshell.geom.tree(backend="opencascade.trianglebvh")`; the default brep backend has no
+  `*_many` queries. Use **intersection** (not collision) for hard clashes: collision misses one element wholly
+  inside another. Clearance query gives true gaps.
+- Never call the clash queries with an empty set: IfcOpenShell segfaults (guarded in `verify.check`).
+- `geometry.edit_object_placement(..., is_si=False)` scales the matrix you pass to SI **in place**: pass a copy when
+  the matrix is used again. A frame shared by a route's fittings put every fitting after the first a thousandth of
+  the way to the origin on millimetre models (0.3048 on feet), and the check passed them in empty space. Metre test
+  fixtures can't show it; test placements on mm or feet with a non-zero placement translation (Revit's way).
+- Speed: element boxes are cached once at open (`IfcScene.bounds()`, ~3 s on Northbank), each check triangulates
+  only the neighbourhood: 0.4–0.6 s per check on Northbank.
+- Every clash query triangulates an element with the same kernel (`scene.kernel`): Revit's faceted meshes
+  (`IfcFacetedBrep`, `IfcFaceBasedSurfaceModel`, no openings) on the mesh kernel, the rest OpenCASCADE. OpenCASCADE
+  sews those meshes first (Snowdon Towers' check: 150 s, 17 s this way); the two kernels close them differently, so
+  detection, the live measure and `verify.check` must use the same rule or a clash found is not one the check sees.
+- Port-connected neighbours are ignored in checks (they touch by design); `IfcFeatureElement` (openings) and
+  virtual elements are not physical.
+- three.js is Y-up, IFC Z-up: viewer delta = (dx, dz, −dy).
+
+## Demo data: Northbank
+
+Generated by IssueLab's own scripts in the private demo-models repo (`northbank/`); the six IFCs now ship in
+`samples/` under MIT, alongside PC-03's two STEP revisions. Other local sample data stays gitignored. Northbank
+predates the hackathon and is a synthetic baseline asset, not work created during the challenge
+(`BUILT_DURING_HACKATHON.md`). Coordination set = Structure + MEP + Architecture; Grids and Site are context only.
+Answer key: three clashes on the Level 02 transfer girder `TB-L02-01` (`1eVHoPtl1IhAbbhivqVqb0`):
+
+| | Element | GlobalId | Hit |
+|---|---|---|---|
+| #042 | Supply air main `SA-MAIN-L02-5` | `2AbvqKF25LGeR0M34N_jld` | −300 mm |
+| #057 | Cable tray `LV-TRAY-L02-1` | `3tQ7zxxRDMefPXL6hbHmO2` | −400 mm |
+| #061 | Cold water main `CW-MAIN-L02-2` | `1RHD_I4ibLDuUhW1LBAckc` | −400 mm |
+
+Findings (Oct 27, details in spikes/README.md):
+- Raising #042 by 0.40 m passes with exactly 50 mm all round (its web opening).
+- Whole-element moves fail for #057 and #061 (long runs; walls and other services along their length).
+- **Rev04 (`Northbank-MEP-Rev04.ifc`) is the designer's fix and the benchmark:** a local offset on all three:
+  split either side of the girder (about x 2.6–4.4 m), raise the middle piece (duct +400, tray +250, CW +280 mm),
+  short angled pieces with bends either side.
+- With the full model visible the girder is hidden by façade and slabs: the viewer needs a context-ghost mode.
+
+## Images sent to the model (per clash)
+
+| | Content |
+|---|---|
+| A | Pair only, 40% transparent, framed on both, camera outside both, grids on |
+| B | Pair solid + grey context at 85% transparency within 2.5 m, same camera |
+| C | Pair only, 40% transparent, ≈90° from A; a section/side view when one element is a slab/wall/beam |
+| text | Signed distance, names/classes/levels, rule. Severity comes from numbers, not pixels |
+
+## Starting a session
+
+- **Read `docs/architecture/README.md` first** for the map of the application, then the doc for the part you will
+  change (table under "Where things are").
+- **Specs and plans go in `docs/` (like `docs/detection.md`, `docs/requirements.md`), never `docs/superpowers/`, and
+  no superpowers skills** (owner decision, Oct 29). The existing files there are history.
+- Follow `AGENTS.md`: large work uses a branch per slice named for its kind (`feature/…`, `fix/…`, `docs/…`, never a
+  tool prefix like `codex/` or `claude/`) and a PR; do not implement on `main` or merge without authorization. Run
+  the relevant server tests, web build (`npm run build`, `npm test`) and product runtime checks before delivery.
+- Demo models: the eight public IFC/STEP files are already in `samples/`; ordinary local setup needs no private repo.
+  Generator-side evals and Navisworks packages still need `IssueLab-Limited/ClashWiseDemoModels` (its name is a legacy
+  identifier; don't repeat it elsewhere), cloned to `../demo-models`, or set `DEMO_MODELS` to that checkout. Keep
+  the pre-existing Northbank baseline disclosure and preserve model bytes; see `samples/README.md`.
+- Deploy: Modal, public, with proposal caps (owner decision Oct 27). `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` come
+  from the environment, never chat. Once: `modal secret create sightline-meta META_API_KEY="$META_API_KEY"
+  TRIAGE_API_KEY="$BASETEN_API_KEY" --force` (no echo). Then build the web app and `modal deploy deploy/modal_app.py`
+  (README, "Deploy"). Open the URL, load Northbank, try one proposal.
+
+
+## Where things are
+
+The map of the whole application is `docs/architecture/` (start at its `README.md`): one doc per part, with
+diagrams, checked against the code. Feature designs (the "why") stay in `docs/*.md`, and the map links to them.
+
+| To understand | Read in `docs/architecture/` |
+|---|---|
+| What ORCA does, every way in, the golden path | `01-product-and-journeys.md` |
+| The big picture: parts, process, threads, locks | `02-system-architecture.md` |
+| One user action end to end (sequence diagrams) | `03-end-to-end-flows.md` |
+| Every server module and what it depends on | `04-server-code-map.md` |
+| Objects, ids, lifecycles, where state lives | `05-domain-model-and-state.md` |
+| Scene loading, the check, detection | `06-geometry-and-detection.md` |
+| Fix kinds, the registry, edits, accept in place | `07-fixes-and-edits.md` |
+| Models, hosts, prompts, effort, spend | `08-ai-models-prompts-and-spend.md` |
+| Agent loop, plans, triage, titles, chat, escalation, built views | `09-agent-workflows.md` |
+| Every route, stream event, header and error | `10-http-api-and-streams.md` |
+| MCP tools and pairing links | `11-mcp-and-agent-links.md` |
+| The React app, its state and modules | `12-web-app.md` |
+| The 3D viewer | `13-3d-viewer.md` |
+| IFC, STEP, Navisworks, uploads, export, PDF, BCF | `14-files-in-and-out.md` |
+| Requirements, settings, every env var | `15-requirements-settings-and-config.md` |
+| Secrets, the owner, caps, budgets | `16-security-caps-and-cost.md` |
+| The Modal deploy and running it | `17-deployment-and-operations.md` |
+| Tests, evals, what to run before delivery | `18-testing-and-evals.md` |
+| Northbank and the palletising cell | `19-demo-data.md` |
+| Owner decisions, rejected ideas, known limits, roadmap | `20-decisions-limits-and-roadmap.md` |
+| Words and names | `21-glossary-and-naming.md` |
+| The dated build log, Oct 27–30 (it used to live here) | `22-build-log.md` |
+
+## Keep the docs current (every agent, every change)
+
+- **A change to core behaviour updates the matching doc in `docs/architecture/` in the same PR.** Core means a new,
+  renamed or removed module, route, stream event, fix kind, model or prompt, env var, cap or budget, stored state or
+  id, deploy step, test harness, user-facing flow, or an owner decision. The table in `docs/architecture/README.md`
+  ("Keeping these docs current") says which doc each kind of change touches; each doc ends with its own "When to
+  update this doc" list.
+- When you re-check a doc against the code, update its "Checked against code" date and commit. If you find a doc
+  wrong, fix it, even when your change didn't cause it.
+- Record notable work as a short dated entry at the end of `docs/architecture/22-build-log.md` (what changed, where,
+  how it was checked), not in this file. This file keeps the rules, the traps and the status.
+- `server/tests/test_docs_map.py` fails when a server module, prompt, web source file, route, MCP tool or env var is
+  missing from the map, or a link in it is broken. Fix it by adding the doc line, never by loosening the test.
+- A feature with a design of its own still gets `docs/<feature>.md` (like `docs/edits.md`); the map links to it.
+
+## Traps
+
+- **Web tests stub App's imports:** a new import in `web/src/App.tsx` must be added to both stub lists
+  (`web/tests/app-host.mjs` and `app-replacement.test.mjs`), or `npm test` fails to resolve it. Their transform
+  cannot read `for (const [a, b] of …)` in App: iterate keys instead.
+- **Effects return nothing:** Chromium's `scrollIntoView` returns a Promise; an effect that returns it breaks React's
+  cleanup and blanks the panel, so effects use braces.
+- **Streams on Modal:** the edge compresses NDJSON and holds it back from browsers, so every stream goes through
+  `app._ndjson` with `Content-Encoding: identity`. Test a stream with `Accept-Encoding: gzip, deflate, br, zstd`.
+- **Trials don't mark files edited:** `IfcScene.translate` moves and moves back; only a kept fix (`Workspace.apply`,
+  `apply_offset`, `apply_trim`, …) calls `mark_edited`. Edits live in memory: a restart or reopening the models
+  starts clean.
+- **Keeping never trusts the page:** every keep route goes through `plans.apply`, which tries each option again
+  (`plans.recheck`: `agent.TRIES` with the clearance and requirements of the clash in its `pair`), checks several
+  together and keeps all or none (409 `NotVerified` with why). `Workspace.apply_*` are its primitives and do not check.
+  A new fix kind needs a `plans.CANDIDATE` entry.
+- **STEP export:** place shapes with `BRepBuilderAPI_Transform`, never `.Moved()` (names and colours are lost on
+  write).
+- **Prompts say only what differs from the defaults:** "every hard clash matters" in the L3 triage line once turned
+  Muse Spark's 12 model errors into 80 on Northbank.
+- **Numbers people see are measured:** the landing's numbers, the README's "Two demos" table and the demo cards share
+  pictures and numbers; change them together and only from measured runs, and recapture `web/public/demos/*.webp`
+  after visual changes: the stills with `web/scripts/capture-demos.cjs`, the cards' and steps' clips with
+  `capture-proposals.cjs --landing` (live proposals; rewrite their alt text from the new run).
+- **The dev server watches `sightline/` only** (`--reload-dir sightline`, README). Plain `--reload` watches
+  `server/.venv` too: a `uv sync` or install from another session restarted it and dropped every open model (Nov 2).
+- **Modal CLI behind the cloud session's proxy** needs `uv tool install 'modal[api-proxy-support]'`. **On Windows** it
+  stops mid-deploy printing ✓ ("'charmap' codec can't encode"): set `PYTHONIOENCODING=utf-8` first. Not installed?
+  `uvx --from modal modal deploy deploy/modal_app.py`.
+- **Muse Code has no `muse mcp add`:** it takes the settings JSON (`docs/mcp.md`).
+- **Nothing names a demo, a domain or a vendor outside its home:** demos in `server/sightline/demos.py` (and the tour,
+  landing, evals), building or machine and what stays in place in the requirements (`IfcScene.stays`, never a class
+  list in a fix path), the 25 mm default in `requirements.DEFAULT_CLEARANCE_M`, model names from `GET /api/models`
+  (`web/src/aiNames.ts`), limits in `SIGHTLINE_*` settings. A prompt example must never be a demo's answer.
+
+## Status and next steps
+
+Live (Modal app `orca`): https://dodzikojo--orca-web.us-east.modal.run.
+
+Built Oct 27–31, all verified by geometry before anyone sees a fix: ORCA's own detection (and Navisworks reports),
+`#N` numbers and Muse titles, bulk triage, seven fix kinds (move, offset with bends, trim, route, penetration, resize,
+seat) plus combined fixes, joints (a move takes its fittings along and stretches what it runs along, or is refused;
+the viewer lights what an element is linked to: `docs/connections.md`), Fix together and root causes, Insights
+patterns, chat and live voice, the MCP server with pairing links, coordination requirements, STEP models (the
+palletising cell), PDF reports and BCF, IFC/STEP export, accept in place, escalation to Muse Wonder, Show it built,
+phones and tablets, guided tours, free navigation and drawing views (plans, sections, elevations beside 3D, up to
+four), measuring in every view with snapping (`docs/measure.md`), desktop panels that dock, collapse, float and pop
+out (`docs/panels.md`, dockview's free core), everything the model says about any object (a Properties panel with
+breadcrumbs to its storey, building, site and project, icon buttons, and a filter from any value), filters by property
+(colour, colour by value, hide, isolate, in every view, from the panel, chat, voice or MCP: `docs/filters.md`) and
+clash checks on them (a filter against everything, itself or another filter, from the panel, chat or MCP), kept
+checks (each check's latest result side by side in one list, one #N per clash, triage verdicts that follow the clash:
+`docs/detection.md`, "Kept checks"),
+Workings (the Activity panel draws each run as it happens: `docs/workings.md`), and (Nov 1) hand edits with one edit
+log: the Edit tool (P: push/pull a face, align, move, void, cut by shape, split, remove a section, delete, clip; each
+checked before Keep, "Keep with N clashes" never verified), Muse and agents doing the same on the person's own word,
+every kept edit (fixes too) logged with its clash and the fix it follows, undo/redo (Ctrl+Z), and the log in the
+report, BCF and exported IFC (`docs/manual-edits.md`; Nov 1: 744 server tests, 213 web tests, answer key 3/3), and
+(Nov 1) models added to the open ones or taken out without opening again, everything kept staying
+(`docs/add-and-remove-models.md`). Latest
+validation (Oct 31): 674 server tests, 187 web tests (with the filters and checks on them); answer key 3/3 first try at Rev04 heights and
+`evals/step_cell.py` passing (C1, C2, C3, C6, C7, C8, Rev B 0) with requirements off (with Northbank's own on: Oct
+30), both last run before the filters, which changed nothing in the fix path. How each part works now: `docs/architecture/`. What was built when, with the numbers measured at the time:
+`docs/architecture/22-build-log.md`.
+
+Next, in order.
+1. ✅ Spike 4 passed with images (spikes/README.md). ✅ Opening heights fed as text (`edits.passages`).
+2. ✅ Local-offset edit, verified on #042/#057/#061 at Rev04's heights. ✅ Bends. Later: sideways offsets, splitting
+   at fittings.
+3. ✅ Viewer: context/x-ray modes, section box, measure. ✅ A/B/C capture in the browser (detected clashes).
+   ✅ Free navigation (leave a clash, view cube, orthographic, styles, visibility, saved views) and plan, section and
+   elevation views beside the 3D view, up to four (`docs/views.md`, Oct 30). Later: walk, an elevation's crop.
+4. ✅ Agent loop end to end in the UI, streamed. ✅ Chat panel with tools. Later: expose the report tools on the MCP
+   server too.
+5. ✅ Bulk triage, live on Muse Spark Open (Baseten). ✅ Voice. ✅ Export IFC. ✅ PDF reports + BCF. ✅ ORCA
+   detection (no Navisworks needed). ✅ #N numbers and Muse titles. ✅ Demo, tour and landing on detection. ✅ STEP
+   models and the palletising cell (from STEP) as the second demo.
+6. ✅ Escalating to Muse Wonder (`docs/escalation.md`) and ✅ Show it built (`docs/show-it-built.md`).
+   Muse Image cannot design a fix (Oct 29: it redraws the geometry and invents numbers); it only restyles one.
+7. Freeze Nov 3, record video; submit Nov 4 before noon ET.
+
+Later (not in the hackathon build): user accounts and saved projects; STEP machines placed inside building models;
+offsets and trims on meshed STEP parts; more model formats, glTF/GLB first, converted to IFC like STEP; connectors
+into design tools (Inventor, Revit and others); site data aligned to the coordination model with SAM 3.1 (all Oct 31,
+`docs/architecture/20-decisions-limits-and-roadmap.md`).
