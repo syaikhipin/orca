@@ -778,7 +778,7 @@ export const api = {
   lock: () => call<{ owner: boolean }>("/owner/lock", { method: "POST" }),
   settings: () => call<SettingsState>("/settings"),
   /** Which model this browser's titles and triage would use now (the owner's choice, else the setting for everyone). */
-  models: () => call<{ triage: TriageModel; escalation?: EscalationInfo; built_views?: boolean; labels?: Partial<Record<"proposal" | "escalation" | "triage" | "image" | "voice", string>>;
+  models: () => call<{ triage: TriageModel; escalation?: EscalationInfo; built_views?: boolean; voice_enabled?: boolean; labels?: Partial<Record<"proposal" | "escalation" | "triage" | "image" | "voice", string>>;
     triage_workers?: number; model_upload_max_mb?: number; model_upload_max_files?: number }>("/models"),
   /** Every physical element's class and name (GlobalId → [class, name]): a built view's cutaway costs, its caption. */
   classes: (sceneId: string) => call<Record<string, [string, string]>>(`/scenes/${sceneId}/classes`),

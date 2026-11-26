@@ -66,12 +66,13 @@ const SUGGESTIONS = [
   "Which clashes share a cause? Fix the root cause.",
 ];
 
-export function ChatPanel({ context, onEvent, owner, ready, ask, voiceModel = "voice transcription" }: {
+export function ChatPanel({ context, onEvent, owner, ready, ask, voiceModel = "voice transcription", voiceEnabled = true }: {
   context: () => { scene_id: string | null; report_id: string | null; clash_id: string | null; fixed: string[]; filters?: SharedFilter[]; filter_view?: FilterView };
   onEvent: (e: ChatEvent) => void;
   owner: ChatRequestOwner;
   ready: boolean;
   voiceModel?: string;   // the model that hears speech (server: /api/models labels.voice)
+  voiceEnabled?: boolean;   // server: /api/models voice_enabled — false hides the mic entirely
   ask?: { text: string; send: boolean; n: number };  // the tour: put this in the box, or send it
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -350,7 +351,7 @@ export function ChatPanel({ context, onEvent, owner, ready, ask, voiceModel = "v
           disabled={!ready} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!voiceOn) send(draft); } }} aria-label="Message" />
         <button className="btn primary" data-tour="chat-send" disabled={!ready || busy || voiceOn || !draft.trim()}>{busy ? "…" : "Send"}</button>
-        {(LiveVoice.supported() || VoiceRecorder.supported()) && <>
+        {(voiceEnabled && (LiveVoice.supported() || VoiceRecorder.supported())) && <>
           <button type="button" className={`btn mic${voice.state === "listening" ? " on" : ""}${speaking ? " speaking" : ""}`}
             disabled={voice.state === "finishing" || voice.state === "transcribing" || (!voiceOn && (!ready || (busy && !handsFree)))}
             onPointerDown={(e) => { if (e.button !== 0) return; e.preventDefault(); e.currentTarget.setPointerCapture?.(e.pointerId); micDown(); }}

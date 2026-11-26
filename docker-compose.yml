@@ -13,6 +13,9 @@ services:
       - SIGHTLINE_ESCALATE_PER_DAY=30
       - SIGHTLINE_WONDER_MAX_USD_DAY=25
       - SIGHTLINE_BUILT_VIEWS=0
+      # Speech off: Opencode Go has no transcription endpoint (Meta-only
+      # /asr/transcribe), so the mic is hidden and the voice routes refuse.
+      - SIGHTLINE_VOICE=off
       - SIGHTLINE_BUILT_PER_HOUR=6
       - SIGHTLINE_BUILT_PER_DAY=60
       - SIGHTLINE_CHAT_PER_HOUR=40

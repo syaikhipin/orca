@@ -368,12 +368,13 @@ export function App() {
     api.models().then((m) => {
       setTriageModel(m.triage); setUploadMax(m.model_upload_max_mb ?? null); setEscalation(m.escalation ?? null);
       setLabels(setAiNames(m.labels)); setTriageWorkers(m.triage_workers ?? null);
-      setBuiltOn(!!m.built_views);
+      setBuiltOn(!!m.built_views); setVoiceEnabled(m.voice_enabled !== false);
     }).catch(() => undefined);
   }, [ownerSettings, modelsAsked]);
   const canEscalate = !!escalation?.available && escalation.mode !== "off";
   // Show it built (docs/show-it-built.md): pictures of fixes, only while the switch is on for this visitor.
   const [builtOn, setBuiltOn] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);   // server: /api/models voice_enabled (SIGHTLINE_VOICE)
   const wonder = escalation?.label ?? labels.escalation;
   // How much a visitor may upload, from the server (checked here before anything is sent).
   const [uploadMax, setUploadMax] = useState<number | null>(null);
@@ -3831,7 +3832,7 @@ export function App() {
       {inSlot(slots.chat, <div className="chat-slot" hidden={!docked && tab !== "chat"}>
           {context && <button className="context-chat-link btn" onClick={() => { clearManual(); setTab("plan"); setPlanKind("context"); setViewContext(true); setViewPlan(false); }}>
             <Network size={14} aria-hidden /> {contextWorking ? "Wider fix: inspecting and checking…" : context.accepted ? "Wider fix accepted" : `Review wider fix · ${context.result?.proposals.length ?? 0} alternatives`}</button>}
-          <ChatPanel key={`${sceneId}:${chatReport}`} voiceModel={labels.voice} owner={chatOwner.current} ready={!!(sceneId || report) && !busy}
+          <ChatPanel key={`${sceneId}:${chatReport}`} voiceModel={labels.voice} voiceEnabled={voiceEnabled} owner={chatOwner.current} ready={!!(sceneId || report) && !busy}
             onEvent={(e) => { if (sceneEpoch.current === renderedSceneEpoch && workspaceEpoch.current === renderedWorkspaceEpoch) onChatEvent(e); }} ask={chatAsk}
             context={() => ({ scene_id: sceneId, report_id: report?.id ?? null, clash_id: clash?.id ?? null, fixed: resolved, filters: sharedFilters, filter_view: filterView, check: viewCheck,
               selected: editPick.current ?? (selected ? { element: selected.globalId, face: null } : null) })} />

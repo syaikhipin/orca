@@ -185,6 +185,9 @@ detect_limit = ProposeLimit(env_int("SIGHTLINE_DETECT_PER_HOUR", 0),
 edit_rerun_limit = ProposeLimit(3 * detect_limit.per_client_hour, 3 * detect_limit.per_day, noun="runs after hand edits")
 voice_limit = ProposeLimit(env_int("SIGHTLINE_VOICE_PER_HOUR", 0),
                            env_int("SIGHTLINE_VOICE_PER_DAY", 0), noun="voice messages")
+# Speech can be switched off per deployment (SIGHTLINE_VOICE=off): this one
+# has no transcription host, so the mic is hidden and both voice routes refuse.
+VOICE_ENABLED = os.environ.get("SIGHTLINE_VOICE", "on") != "off"
 # Model uploads (IFC or STEP): each takes disk, memory and, for STEP, a conversion and one model call to name its parts.
 model_upload_limit = ProposeLimit(env_int("SIGHTLINE_MODEL_UPLOADS_PER_HOUR", 0),
                                   env_int("SIGHTLINE_MODEL_UPLOADS_PER_DAY", 0), noun="model uploads")
@@ -389,6 +392,7 @@ def models():
     """Which model this request's titles and triage would use (the owner's choice, else everyone's), for the copy, and
     how much a visitor may upload (the page checks before sending, and says so)."""
     return {"triage": triage_model_info(), "escalation": escalation_info(), "built_views": settings.built_views(),
+            "voice_enabled": VOICE_ENABLED,
             "labels": model_labels(), "triage_workers": env_int("SIGHTLINE_TRIAGE_WORKERS", triage.WORKERS),
             "model_upload_max_mb": MODEL_UPLOAD_MAX_MB, "model_upload_max_files": MODEL_UPLOAD_MAX_FILES}
 
@@ -2118,6 +2122,8 @@ async def transcribe_voice(request: Request, audio: UploadFile = File(...), repo
     """A spoken message to ORCA (Muse Voice Transcribe): a WAV clip in, its transcript out. The browser sends the
     transcript to the chat, so voice can do whatever the chat can. Biased toward coordination words, the domain's and
     the open models' and report's names (`_voice_words`)."""
+    if not VOICE_ENABLED:
+        raise HTTPException(404, "Voice is turned off on this deployment.")
     data = await audio.read(MAX_VOICE_BYTES + 1)
     if len(data) > MAX_VOICE_BYTES:
         raise HTTPException(413, "That recording is too long: keep it under a minute.")
@@ -2160,6 +2166,9 @@ async def voice_live_socket(socket: WebSocket):
     (`{mode: "hold" | "hands_free", report_id, scene_id}`); one session is one voice message against the caps, hands-free too."""
     if not voice_live.same_origin(socket.headers):
         await socket.close(code=1008)  # before accepting: the browser sees a refused handshake
+        return
+    if not VOICE_ENABLED:
+        await socket.close(code=1008)
         return
     await socket.accept()
     try:
