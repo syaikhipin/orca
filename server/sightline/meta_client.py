@@ -198,7 +198,18 @@ class MetaChatModel:
         self.reasoning_effort = (reasoning_effort if reasoning_effort is not None
                                  else os.environ.get("META_REASONING_EFFORT", "low"))
         self.role = "default"  # "triage" / "escalation": the owner and settings set their effort separately
-        self.client = httpx.Client(timeout=timeout_s)
+        client_headers = {}
+        if "opencode.ai" in self.base_url:
+            # Opencode Go (this deployment's host): Cloudflare rejects the
+            # default Python user agent, and chat calls without a session
+            # header fail with 400 MissingSessionID. Both are client-level
+            # headers so _post and the streaming paths inherit them.
+            client_headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+                "x-opencode-session": "orca-arifin",
+            }
+        self.client = httpx.Client(timeout=timeout_s, headers=client_headers)
         self.usage = Usage()
         # Hears each call's cost in USD as it lands (the escalation charges the day's limit with it, spend.py).
         self.on_cost: Callable[[float], None] | None = None

@@ -29,15 +29,23 @@ services:
       - SIGHTLINE_LINKS_PER_HOUR=10
       - SIGHTLINE_LINKS_PER_DAY=500
       - SIGHTLINE_AGENT_CALLS_PER_HOUR=600
-      - SIGHTLINE_OPEN_WEIGHTS=0
+      - SIGHTLINE_OPEN_WEIGHTS=1
       # Behind the Cloudflare tunnel + Coolify proxy, the visitor's address
       # arrives in X-Forwarded-For (Modal sets 0 because its edge differs).
       - SIGHTLINE_TRUST_FORWARDED=1
-      # AI features (proposals, chat, escalation) use an OpenAI-compatible
-      # endpoint. META_API_KEY is set in Coolify's environment, never in git:
-      # the owner's Opencode Go key, same as GreenForge.
+      # ALL AI features run on the owner's Opencode Go subscription.
+      # META_API_KEY and TRIAGE_API_KEY (the same Opencode Go key) are set in
+      # Coolify's environment, never in git.
       - META_API_BASE_URL=https://opencode.ai/zen/go/v1
       - META_MODEL=glm-5.3
+      - META_ESCALATION_MODEL=glm-5.3
+      # GLM on Go takes no reasoning_effort parameter; empty omits it.
+      - META_REASONING_EFFORT=
+      - META_ESCALATION_EFFORT=
+      # Bulk triage/titles on the cheaper flash model, same endpoint + key.
+      - TRIAGE_API_BASE_URL=https://opencode.ai/zen/go/v1
+      - TRIAGE_MODEL=glm-5.3-flash
+      - TRIAGE_REASONING_EFFORT=
     # No host port binding: GreenForge already owns host :8000 on campus-pc.
     # Coolify's proxy reaches this container on its internal port via labels.
     expose:
